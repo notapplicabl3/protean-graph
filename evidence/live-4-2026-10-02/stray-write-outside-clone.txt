@@ -1,6 +1,0 @@
-~/protean/protean
-~/protean/protean/state
-~/protean/protean/state/task-20261002T040236
-~/protean/protean/state/task-20261002T040236/clones
-~/protean/protean/state/task-20261002T040236/clones/u-3
-~/protean/protean/state/task-20261002T040236/clones/u-3/summarize.py

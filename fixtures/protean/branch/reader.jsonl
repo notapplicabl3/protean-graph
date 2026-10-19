@@ -1,0 +1,1 @@
+{"type": "result", "subtype": "success", "is_error": false, "session_id": "dry-reader", "total_cost_usd": 0.05, "result": "{\"verdict\": \"yes\", \"note\": \"metrics.py is the stats module under its new name, mean() included: nothing u-1 p1 verified is lost.\"}"}

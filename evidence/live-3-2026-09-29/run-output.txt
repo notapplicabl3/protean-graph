@@ -1,8 +1,0 @@
-task task-20260929T192316: Exactly three units, planned in this order: C first, then A, then B. Unit A adds stats.py with mean(numbers) returning the arithmetic mean of a non-empty list of numbers, with tests in tests/test_stats.py. Unit B adds number_io.py with read_numbers(path) returning the list of floats in a text file, one number per line, with tests in tests/test_number_io.py. Unit C adds summarize.py with summarize(path) that reads the file with read_numbers from number_io and returns mean from stats of those numbers, with tests in tests/test_summarize.py that write a temporary file and check the result, so both predecessors are exercised. Unit C needs A and B: list it first and mark its needs so it waits for them. Every unit's predicates must include a command predicate that uv run pytest -q passes in the clone.
-tick 1: director added u-c, u-a, u-b ($0.07)
-tick 2: u-a attempt 1: passed ($0.41)
-tick 3: u-b attempt 1: passed ($0.24)
-tick 4: u-c attempt 1: passed ($0.26)
-tick 5: director said done: every unit verified ($0.54)
-terminal: done — 3 unit(s) verified, $1.51, 5 ticks
-EXIT=

@@ -5,7 +5,7 @@ build-backend = "hatchling.build"
 [project]
 name = "protean"
 version = "0.1.0"
-description = "PROTEAN — a small loop around Claude Code: a director seat plans units, a contained editor does each one, a grader verifies, a mailbox carries questions."
+description = "PROTEAN — a small loop around Claude Code: a thinker seat moves a thought forward one move at a time, a contained editor does each unit in a clone, a grader verifies, a console carries the operator's thoughts and answers."
 requires-python = ">=3.13"
 dependencies = [
     "pydantic==2.13.5",

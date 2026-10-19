@@ -1,0 +1,1 @@
+"""The nodes of the graph, one module each: director (cortex), worker (editor), grade (grader), budget, console (the human channel; it replaced the mailbox 2026-10-10). The ring — loop, state, runner — stays at the package root."""

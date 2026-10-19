@@ -11,8 +11,8 @@ from pathlib import Path
 
 import pytest
 
-from protean import worker
-from protean.budget import Caps
+from protean.graph import worker
+from protean.graph.budget import Caps
 from protean.dry import ScriptedRunner, make_workspace
 from protean.runner import RunResult, real_runner
 from protean.state import Predicate, Root, Task, Unit
@@ -32,6 +32,24 @@ def ready(tmp_path: Path, root: Root, task: Task) -> tuple[Root, Task]:
     return root, task
 
 
+def test_the_editor_may_run_its_own_units_check_commands(ready: tuple[Root, Task]):
+    """Run 6 (2026-10-16): the grant allowed only `uv` and a few `git` verbs, so `bash tests/x.sh` was denied in
+    dontAsk mode and an honest editor could not verify; the unit's own command predicates are granted as prefixes."""
+    root, task = ready
+    unit = Unit(id="u2", intent="make the acks tiered", predicates=[
+        Predicate(kind="command", args={"cmd": "bash -n bin/turn.sh", "expect_exit": 0}, retain=False),
+        Predicate(kind="command", args={"cmd": "bash tests/test_turn_acks.sh", "expect_exit": 0}, protected=["tests"]),
+        Predicate(kind="file_contains", args={"path": "bin/turn.sh", "text": "EA_ACK_S:-"}),
+        Predicate(kind="command", args={"cmd": "bash -n bin/turn.sh", "expect_exit": 0}, retain=False),
+    ])
+    task.units.append(unit)
+    runner = ScriptedRunner([], [WRITE_A])
+    worker.run_unit(task, unit, Caps(), root, runner)
+    argv = runner.calls[0][0]
+    grant = argv[argv.index("--allowedTools") + 1:argv.index("--system-prompt")]
+    assert grant == [*worker.TOOLS, "Bash(bash -n bin/turn.sh:*)", "Bash(bash tests/test_turn_acks.sh:*)"]
+
+
 def test_the_clone_works_on_unit_branch_and_the_branch_lands_unmerged(ready: tuple[Root, Task]):
     root, task = ready
     workspace = Path(task.workspace)
@@ -39,9 +57,10 @@ def test_the_clone_works_on_unit_branch_and_the_branch_lands_unmerged(ready: tup
     runner = ScriptedRunner([], [WRITE_A])
     res = worker.run_unit(task, task.units[0], Caps(), root, runner)
     argv, stdin, cwd, timeout = runner.calls[0]
-    assert argv[:2] == [worker.sandbox_binary(), "-p"] and argv[2] == worker.sandbox_profile(res.clone)
+    assert argv[:2] == [worker.sandbox_binary(), "-p"]
+    assert argv[2] == worker.sandbox_profile(res.clone, root.console_file(task.id))
     assert argv[3:] == [
-        "claude", "-p", "--setting-sources", "", "--output-format", "json", "--max-budget-usd", "4.00",
+        "claude", "-p", "--setting-sources", "", "--output-format", "stream-json", "--verbose", "--max-budget-usd", "4.00",
         "--model", "claude-opus-5",
         "--permission-mode", "dontAsk", "--allowedTools", "Read", "Edit", "Write", "Grep", "Glob", "Bash(uv:*)",
         "Bash(git status:*)", "Bash(git diff:*)", "Bash(git add:*)", "Bash(git commit:*)", "Bash(git checkout:*)",
@@ -92,7 +111,8 @@ def _acting(action) -> object:
     """A worker that does `action` in its clone and reports success."""
     def runner(argv, stdin, cwd, timeout):
         action(Path(cwd))
-        return RunResult(0, json.dumps({"is_error": False, "result": "done\nexit_code: 0", "total_cost_usd": 0.5}), "")
+        return RunResult(0, json.dumps({"type": "result", "is_error": False, "result": "done\nexit_code: 0",
+                                        "total_cost_usd": 0.5}), "")
     return runner
 
 
@@ -129,7 +149,7 @@ def test_delivery_is_checked_after_the_worker_run(ready: tuple[Root, Task], acti
 
 def test_the_call_cap_is_clipped_to_what_the_task_has_left(ready: tuple[Root, Task]):
     root, task = ready
-    task.cost_usd = 8.5
+    task.cost_usd = 23.5
     runner = ScriptedRunner([], [WRITE_A])
     worker.run_unit(task, task.units[0], Caps(), root, runner)
     argv = runner.calls[0][0]
@@ -140,7 +160,7 @@ def test_a_timeout_reports_no_exit_code_and_is_charged_its_cap(ready: tuple[Root
     root, task = ready
     res = worker.run_unit(task, task.units[0], Caps(), root, lambda *_: RunResult(-9, "", "", True))
     assert (res.exit_code, res.cost_usd, res.changed) == (None, 4.0, []) and "timed out after 900s" in res.summary
-    task.cost_usd = 8.5
+    task.cost_usd = 23.5
     res = worker.run_unit(task, task.units[0], Caps(), root, lambda *_: RunResult(-9, "", "", True))
     assert res.cost_usd == 1.5
 
@@ -159,7 +179,7 @@ def test_an_interrupt_after_the_call_returned_books_the_real_cost(ready: tuple[R
 
 
 def _receipt(result: str, **extra: object) -> str:
-    return json.dumps({"is_error": False, "result": result, "total_cost_usd": 1.5, **extra})
+    return json.dumps({"type": "result", "is_error": False, "result": result, "total_cost_usd": 1.5, **extra})
 
 
 @pytest.mark.parametrize("res, exit_code, cost", [
@@ -177,14 +197,13 @@ def test_only_the_workers_own_line_is_exit_code_evidence(res: RunResult, exit_co
     assert (code, dollars) == (exit_code, cost)
 
 
-def test_real_runner_passes_stdin_and_kills_the_whole_group_on_timeout(tmp_path: Path):
+def test_real_runner_passes_stdin_and_kills_the_whole_group_on_timeout(tmp_path: Path, reaped):
     ok = real_runner(["sh", "-c", "cat; echo err >&2; exit 3"], "hello", tmp_path, 10)
     assert (ok.returncode, ok.stdout, ok.stderr, ok.timed_out) == (3, "hello", "err\n", False)
     started = time.monotonic()
-    res = real_runner(["sh", "-c", "(sleep 2; touch late) & sleep 30"], None, tmp_path, 1)
+    res = real_runner(["sh", "-c", "(sleep 30; touch late) & echo $! > kid; sleep 30"], None, tmp_path, 0.5)
     assert res.timed_out and time.monotonic() - started < 5
-    time.sleep(2.5)
-    assert not (tmp_path / "late").exists()
+    assert reaped(tmp_path / "kid") and not (tmp_path / "late").exists()  # the leader's child died with its group
 
 
 def _build_output(clone: Path) -> None:
@@ -288,7 +307,8 @@ def test_the_editor_call_is_wrapped_in_the_sandbox_and_refused_without_it(ready:
     runner = ScriptedRunner([], [WRITE_A])
     res = worker.run_unit(task, task.units[0], Caps(), root, runner)
     (argv, _, _, _) = runner.calls[0]
-    assert argv[0].endswith("sandbox-exec") and argv[1] == "-p" and argv[2] == worker.sandbox_profile(res.clone)
+    assert argv[0].endswith("sandbox-exec") and argv[1] == "-p"
+    assert argv[2] == worker.sandbox_profile(res.clone, root.console_file(task.id))
     assert argv[3:5] == ["claude", "-p"]
     monkeypatch.setattr(worker.shutil, "which", lambda name: None)
     second = ScriptedRunner([], [WRITE_A])

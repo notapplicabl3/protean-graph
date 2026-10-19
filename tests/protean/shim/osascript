@@ -1,0 +1,5 @@
+#!/bin/sh
+# Stand-in for macOS osascript, first on PATH for every protean test: a notification is recorded, never shown.
+for last; do :; done
+[ -n "$PROTEAN_OSASCRIPT_LOG" ] && printf '%s\n' "$last" >> "$PROTEAN_OSASCRIPT_LOG"
+exit 0

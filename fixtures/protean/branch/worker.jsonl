@@ -1,0 +1,3 @@
+{"write": {"stats.py": "def mean(xs):\n    return sum(xs) / len(xs)\n"}, "commit": true, "exit_code": 0, "result": "Wrote stats.py with mean().", "total_cost_usd": 0.5}
+{"write": {"metrics.py": "def mean(xs):\n    return sum(xs) / len(xs)\n"}, "delete": ["stats.py"], "commit": true, "exit_code": 0, "result": "Renamed stats.py to metrics.py.", "total_cost_usd": 0.5}
+{"write": {"NOTES.md": "# metrics\n\nmean() lives in metrics.py.\n"}, "commit": true, "exit_code": 0, "result": "Wrote NOTES.md.", "total_cost_usd": 0.5}

@@ -1,4 +1,36 @@
 #!/bin/sh
-# Stand-in for the model binary, first on PATH for every protean test. Reaching it is a failure.
+# Stand-in for the model binary, first on PATH for every protean test. Reaching it is a failure, with one exception:
+# a test that wants the editor's stream names a script in PROTEAN_SHIM_STREAM and the call asks for
+# `--output-format stream-json`. Then the shim emits the script's lines on stdout, one per line, except two
+# directives: `WAIT <path>` holds until that file exists (at most 10 s), `SH <command>` runs a shell command in the
+# working directory (the clone). Like the real CLI (2.1.296), `-p --output-format stream-json` without `--verbose`
+# is refused before anything runs. With PROTEAN_SHIM_LOG set, every invocation first appends its argv there, one line
+# per call, so a test can show the shim recorded no call.
+if [ -n "$PROTEAN_SHIM_LOG" ]; then printf '%s\n' "$*" >> "$PROTEAN_SHIM_LOG"; fi
+stream=""; verbose=""; prev=""
+for arg; do
+  if [ "$prev" = "--output-format" ] && [ "$arg" = "stream-json" ]; then stream=1; fi
+  if [ "$arg" = "--verbose" ]; then verbose=1; fi
+  prev=$arg
+done
+if [ -n "$stream" ] && [ -z "$verbose" ]; then
+  echo "Error: When using --print, --output-format=stream-json requires --verbose" >&2
+  exit 1
+fi
+if [ -n "$stream" ] && [ -n "$PROTEAN_SHIM_STREAM" ]; then
+  cat > /dev/null
+  while IFS= read -r line || [ -n "$line" ]; do
+    case "$line" in
+      "WAIT "*)
+        tries=0
+        while [ ! -e "${line#WAIT }" ] && [ "$tries" -lt 200 ]; do sleep 0.05; tries=$((tries + 1)); done ;;
+      "SH "*)
+        sh -c "${line#SH }" > /dev/null 2>&1 ;;
+      *)
+        printf '%s\n' "$line" ;;
+    esac
+  done < "$PROTEAN_SHIM_STREAM"
+  exit 0
+fi
 echo "SHIM: the real binary was reached" >&2
 exit 89

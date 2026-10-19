@@ -1,0 +1,5 @@
+{"write": {"keep.txt": "keep\n"}, "commit": true, "exit_code": 0, "result": "Wrote keep.txt; the scaffold can wait.", "total_cost_usd": 0.5}
+{"write": {"keep.txt": "keep\n", "scaffold.txt": "placeholder\n"}, "commit": true, "exit_code": 0, "result": "Wrote keep.txt and scaffold.txt.", "total_cost_usd": 0.5}
+{"write": {"real.txt": "real\n"}, "delete": ["scaffold.txt"], "commit": true, "exit_code": 0, "result": "Wrote real.txt and removed the scaffold it replaces.", "total_cost_usd": 0.5}
+{"write": {"extra.txt": "extra\n", "keep.txt": "tidied\n"}, "commit": true, "exit_code": 0, "result": "Wrote extra.txt and tidied keep.txt.", "total_cost_usd": 0.5}
+{"write": {"extra.txt": "extra\n"}, "commit": true, "exit_code": 0, "result": "Wrote extra.txt and left keep.txt alone.", "total_cost_usd": 0.5}

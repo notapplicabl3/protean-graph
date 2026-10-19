@@ -8,11 +8,12 @@ from pathlib import Path
 
 import pytest
 
-from protean import director, loop, mailbox, worker
-from protean.budget import Caps
+from protean import loop
+from protean.graph import director, worker
+from protean.graph.budget import Caps
 from protean.dry import FIXTURES, ScriptedRunner, make_workspace, read_jsonl
 from protean.runner import RunResult
-from protean.state import Predicate, Root, Task, Unit, load, save, set_current
+from protean.state import Predicate, Question, Root, Task, Unit, load, open_questions, save, set_current
 
 TASK_ID = "task-20260927T120000"
 
@@ -28,7 +29,7 @@ def _commit(cwd: Path, *args: str) -> None:
 @pytest.fixture
 def env(tmp_path: Path, root: Root) -> tuple[Root, Path]:
     root.path.mkdir(parents=True)
-    root.director_prompt.write_text("m\n")
+    root.thinker_prompt.write_text("m\n")
     root.editor_prompt.write_text("e\n")
     return root, make_workspace(tmp_path / "ws")
 
@@ -46,7 +47,9 @@ def test_deps_runs_the_needed_units_first_and_the_dependent_sees_their_work(env:
     main = _git(workspace, "rev-parse", "main")
     runner, lines = _scenario("deps"), []
     task = loop.run("deps", workspace, root, Caps(), runner, echo=lines.append)
-    assert task.terminal == "done" and [u.id for u in task.units] == ["u-3", "u-1", "u-2"]
+    assert (task.terminal, task.awaiting_thought) == ("interrupted", True) and [m.kind for m in task.moves] == [
+        "task", "rest"]
+    assert [u.id for u in task.units] == ["u-3", "u-1", "u-2"] and task.moves[0].units == ["u-3", "u-1", "u-2"]
     assert _worker_units(runner) == ["u-1", "u-2", "u-3"]
     assert [line.split(": ")[1].split(" ")[0] for line in lines[2:5]] == ["u-1", "u-2", "u-3"]
     assert all((u.status, u.integrated) == ("passed", True) for u in task.units)
@@ -73,7 +76,7 @@ def test_deps_broken_fails_the_breaking_unit_and_leaves_the_accepted_tip(env: tu
     assert (u1.status, u1.integrated) == ("passed", True)
     before = task.accepted
     assert before == u1.candidate == _git(workspace, "rev-parse", f"task/{task.id}")
-    while task.terminal is None:
+    while task.terminal is None and not open_questions(task):
         loop.run_tick(task, Caps(), root, runner)
     assert (u2.status, u2.attempts, u2.integrated, u2.candidate) == ("failed", 2, False, None)
     assert "broke u-1 p1" in u2.summary
@@ -84,7 +87,8 @@ def test_deps_broken_fails_the_breaking_unit_and_leaves_the_accepted_tip(env: tu
     assert all(v["passed_ids"] == ["p1", "p2"] and "broke u-1 p1" in v["to_director"] for v in verdicts)
     notes = json.loads(runner.calls[-1][1])["notes"]
     assert len(notes) == 2 and all(note.startswith("u-2 broke") and "broke u-1 p1" in note for note in notes)
-    assert task.terminal == "interrupted"
+    assert task.terminal is None and [(q.asker, q.reason) for q in open_questions(task)] == [("director", "question")]
+    assert [m.kind for m in task.moves] == ["task", "ask"] and task.moves[1].question == open_questions(task)[0].id
 
 
 def test_deps_blocked_blocks_the_dependent_and_tells_the_director(env: tuple[Root, Path]):
@@ -102,7 +106,7 @@ def test_deps_blocked_blocks_the_dependent_and_tells_the_director(env: tuple[Roo
     assert task.terminal == "interrupted"
 
 
-def test_blocking_is_transitive_and_follows_a_descope(env: tuple[Root, Path]):
+def test_blocking_is_transitive_and_follows_a_goal_mode_descope(env: tuple[Root, Path]):
     root, workspace = env
     units = [Unit("u-1", "a", [Predicate("file_exists", {"path": "a"})], "failed", 2),
              Unit("u-2", "b", [Predicate("file_exists", {"path": "b"})], needs=["u-1"]),
@@ -112,15 +116,16 @@ def test_blocking_is_transitive_and_follows_a_descope(env: tuple[Root, Path]):
     task = Task(id=TASK_ID, goal="g", workspace=str(workspace), units=units)
     save(root, task)
     set_current(root, task.id)
-    runner = ScriptedRunner([{"type": "result", "is_error": False, "session_id": "s", "total_cost_usd": 0.1,
-                              "result": json.dumps({"done": True})}], [])
+    runner = ScriptedRunner([_reply({"rest": True, "state": {"standing": "Three units are blocked.", "open": []}})],
+                            [])
     loop.run_tick(task, Caps(), root, runner)
     assert [u.status for u in task.units] == ["failed", "blocked", "blocked", "descoped", "blocked"]
     assert _worker_units(runner) == [] and task.terminal is None
+    later = "so it never runs. Give a new unit in a later task if its work is still wanted."
     assert json.loads(runner.calls[0][1])["notes"][:3] == [
-        "u-2 is blocked: it needs u-1, which failed. Descope u-2; plan a new unit if its work is still wanted.",
-        "u-3 is blocked: it needs u-2, which is blocked. Descope u-3; plan a new unit if its work is still wanted.",
-        "u-5 is blocked: it needs u-4, which was descoped. Descope u-5; plan a new unit if its work is still wanted.",
+        f"u-2 is blocked: it needs u-1, which failed, {later}",
+        f"u-3 is blocked: it needs u-2, which is blocked, {later}",
+        f"u-5 is blocked: it needs u-4, which was descoped, {later}",
     ]
     assert load(root, task.id).units[4].status == "blocked"
 
@@ -149,7 +154,7 @@ def _passed_not_integrated(root: Root, workspace: Path, move_ref: bool, **fields
 @pytest.mark.parametrize("move_ref", [False, True])
 def test_a_tick_first_integrates_a_passed_unit_without_calling_anyone(env: tuple[Root, Path], move_ref: bool):
     root, workspace = env
-    task, base, candidate = _passed_not_integrated(root, workspace, move_ref, tick=30)
+    task, base, candidate = _passed_not_integrated(root, workspace, move_ref, tick=100)
     runner = ScriptedRunner([], [])
     loop.run_tick(task, Caps(), root, runner)
     assert runner.calls == [] and task.terminal == "stopped"
@@ -163,7 +168,8 @@ def test_a_tick_first_integrates_a_passed_unit_without_calling_anyone(env: tuple
 @pytest.mark.parametrize("move_ref", [False, True])
 def test_resume_first_integrates_a_passed_unit_without_calling_anyone(env: tuple[Root, Path], move_ref: bool):
     root, workspace = env
-    task, _, candidate = _passed_not_integrated(root, workspace, move_ref, terminal="interrupted", question="q?")
+    task, _, candidate = _passed_not_integrated(root, workspace, move_ref, terminal="interrupted",
+                                                questions=[Question("q1", "director", "q?", "question")])
     runner = ScriptedRunner([], [])
     task = loop.resume(root, Caps(), runner)
     assert runner.calls == [] and task.terminal == "interrupted"
@@ -172,13 +178,13 @@ def test_resume_first_integrates_a_passed_unit_without_calling_anyone(env: tuple
     assert _git(workspace, "rev-parse", f"task/{TASK_ID}") == candidate
 
 
-def test_a_repaired_unit_is_never_worked_again_and_the_task_can_finish(env: tuple[Root, Path]):
+def test_a_repaired_unit_is_never_worked_again_and_the_session_can_rest(env: tuple[Root, Path]):
     root, workspace = env
     task, _, candidate = _passed_not_integrated(root, workspace, False)
-    done = {"type": "result", "is_error": False, "session_id": "s", "total_cost_usd": 0.1, "result": json.dumps({"done": True})}
-    runner = ScriptedRunner([done], [])
+    runner = ScriptedRunner([_reply({"rest": True, "state": {"standing": "a.txt is accepted.", "open": []}})], [])
     task = loop.resume(root, Caps(), runner)
-    assert task.terminal == "done" and _worker_units(runner) == [] and task.accepted == candidate
+    assert (task.terminal, task.awaiting_thought) == ("interrupted", True)
+    assert _worker_units(runner) == [] and task.accepted == candidate
 
 
 def _moved_elsewhere(root: Root, workspace: Path) -> tuple[Task, str, str, str]:
@@ -195,15 +201,17 @@ def test_a_stale_accepted_tip_refuses_the_ref_move(env: tuple[Root, Path]):
     task, base, _, elsewhere = _moved_elsewhere(root, workspace)
     runner = ScriptedRunner([], [])
     loop.run_tick(task, Caps(), root, runner)
-    assert runner.calls == [] and task.terminal == "interrupted"
+    assert runner.calls == [] and task.terminal is None
     assert _git(workspace, "rev-parse", f"task/{TASK_ID}") == elsewhere
     saved = load(root, task.id)
-    assert saved.units[0].integrated is False and saved.accepted == base and saved.terminal == "interrupted"
-    question = mailbox.open_path(root, task.id).read_text()
+    assert saved.units[0].integrated is False and saved.accepted == base
+    (held,) = open_questions(saved)
+    assert (held.asker, held.reason, held.context) == ("runtime", "stale_tip", {"stale_tip": "u-1"})
+    question = held.text
     assert f"task/{TASK_ID} was moved outside the loop" in question and elsewhere[:12] in question and base in question
     assert "protean resume --abandon" in question
     assert loop.resume(root, Caps(), runner).terminal == "interrupted" and runner.calls == []
-    assert load(root, task.id).units[0].integrated is False
+    assert load(root, task.id).units[0].integrated is False and len(load(root, task.id).questions) == 1
 
 
 def test_a_stale_tip_task_can_be_abandoned(env: tuple[Root, Path]):
@@ -212,7 +220,7 @@ def test_a_stale_tip_task_can_be_abandoned(env: tuple[Root, Path]):
     loop.run_tick(task, Caps(), root, ScriptedRunner([], []))
     task = loop.resume(root, Caps(), ScriptedRunner([], []), abandon=True)
     assert (task.terminal, task.stop_reason) == ("stopped", "abandoned")
-    assert (root.mailbox_closed / f"{task.id}-abandoned.md").exists()
+    assert [(q.status, q.disposition) for q in task.questions] == [("superseded", "abandoned")]
     assert _git(workspace, "rev-parse", f"task/{TASK_ID}") == elsewhere
 
 
@@ -221,12 +229,13 @@ def test_a_restored_tip_lets_resume_integrate_and_continue(env: tuple[Root, Path
     task, base, candidate, elsewhere = _moved_elsewhere(root, workspace)
     loop.run_tick(task, Caps(), root, ScriptedRunner([], []))
     _git(workspace, "update-ref", f"refs/heads/task/{TASK_ID}", base, elsewhere)
-    runner = ScriptedRunner([_reply({"done": True})], [])
+    runner = ScriptedRunner([_reply({"rest": True, "state": {"standing": "a.txt is accepted.", "open": []}})], [])
     task = loop.resume(root, Caps(), runner)
-    assert task.terminal == "done" and _worker_units(runner) == [] and len(runner.calls) == 1
+    assert (task.terminal, task.awaiting_thought) == ("interrupted", True)
+    assert _worker_units(runner) == [] and len(runner.calls) == 1
     assert (task.accepted, task.units[0].integrated) == (candidate, True)
     assert _git(workspace, "rev-parse", f"task/{TASK_ID}") == candidate
-    assert not mailbox.open_path(root, task.id).exists()
+    assert [(q.status, q.disposition) for q in task.questions] == [("superseded", "repaired")]
 
 
 # The worker: the accepted branch, branching from its tip, and a candidate that must extend it.
@@ -303,7 +312,7 @@ RESTORE_UNCOMMITTED = "git show HEAD~1:a.txt > a.txt\n"
 
 @pytest.mark.parametrize("script, u1_predicates, note", [
     (RESTORE_AND_COMMIT, [{"kind": "file_exists", "args": {"path": "a.txt"}}], "check commands changed the clone: HEAD moved"),
-    (RESTORE_UNCOMMITTED, [{"kind": "command", "args": {"cmd": "test -f a.txt"}}],
+    (RESTORE_UNCOMMITTED, [{"kind": "command", "args": {"cmd": "test -f a.txt"}, "protected": ["a.txt"]}],
      "check commands left the clone dirty"),
 ])
 def test_a_check_command_that_changes_the_clone_does_not_pass_the_unit(env: tuple[Root, Path], script: str,
@@ -311,8 +320,8 @@ def test_a_check_command_that_changes_the_clone_does_not_pass_the_unit(env: tupl
     root, workspace = env
     units = [{"id": "u-1", "intent": "write a.txt", "predicates": u1_predicates},
              {"id": "u-2", "intent": "write check.sh", "needs": ["u-1"],
-              "predicates": [{"kind": "command", "args": {"cmd": "sh check.sh"}}]}]
-    runner = ScriptedRunner([_reply({"units": units})], [
+              "predicates": [{"kind": "command", "args": {"cmd": "sh check.sh"}, "protected": ["check.sh"]}]}]
+    runner = ScriptedRunner([_reply({"task": units, "state": {"standing": "a.txt, then a check.", "open": []}})], [
         {"write": {"a.txt": "A\n"}, "commit": True, "exit_code": 0, "result": "wrote a.txt", "total_cost_usd": 0.5},
         {"write": {"check.sh": script}, "delete": ["a.txt"], "commit": True, "exit_code": 0, "result": "ok", "total_cost_usd": 0.5},
     ])

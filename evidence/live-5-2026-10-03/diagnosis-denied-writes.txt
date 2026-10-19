@@ -1,9 +1,0 @@
-What the sandbox denied the editor process, as far as the receipts show (run 5, 2026-10-03):
-
-1. The probe write. The editor's own tool result, quoted in its final message:
-   EPERM: operation not permitted, open '~/protean-probe-live5-31bef91c8cdf.txt.tmp.40384.49ca56241df6'
-   The Write tool stages an atomic temp file beside the target; that open was refused at the kernel. The target path was absent after the run (probe-path-absent.txt).
-
-2. The editor's own session. ~/.claude/projects/ holds the director's session directory for this task (...-state-task-20261003T063106-seat) and NO directory for the editor's clone (...-clones-u-1), so the CLI's session and config writes under ~/.claude were denied and the CLI (2.1.287) completed the call regardless.
-
-Not on record: the exact list of paths the CLI tried and was refused. `log show` (info+debug, sender Sandbox / "deny(1)") returned nothing for this run: a custom sandbox-exec profile does not report denials to the unified log unless its deny clause carries `(with report)`. If the exact set is ever needed, a diagnostic run with `(deny file-write* (with report))` captures it; the profile was NOT widened on this evidence, and ~/.claude stays outside the editor's trees.

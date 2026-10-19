@@ -12,8 +12,8 @@ from pathlib import Path
 
 import pytest
 
-from protean import grade as grade_module
-from protean.grade import FILE_BOUND, PREDICATE_KINDS, grade, validate
+from protean.graph import grade as grade_module
+from protean.graph.grade import FILE_BOUND, PREDICATE_KINDS, grade, validate
 from protean.state import Predicate as P
 from protean.state import Unit
 
@@ -38,7 +38,7 @@ def clone(tmp_path: Path) -> Path:
     """A one-commit checkout holding notes.md; file predicates grade what is on its branch."""
     path = tmp_path / "clone"
     path.mkdir()
-    (path / "notes.md").write_text("nothing about widgets here\n")
+    (path / "notes.md").write_text("nothing about pins here\n")
     _git(path, "init", "-q", "-b", "main")
     _commit(path, "notes.md")
     return path
@@ -52,15 +52,15 @@ def test_misspelled_exit_code_arg_is_rejected_at_validation(clone: Path):
 
 
 def test_misspelled_file_contains_arg_is_rejected_at_validation(clone: Path):
-    bad = P("file_contains", {"path": "notes.md", "value": "## Widget inventory"})
+    bad = P("file_contains", {"path": "notes.md", "value": "## Pin inventory"})
     assert validate([bad]) == ["p1 file_contains: missing required arg 'text'", "p1 file_contains: unknown arg 'value'"]
     assert grade(_unit(bad), clone, 0).passed is False
 
 
-def test_a_unit_with_one_true_predicate_among_false_ones_does_not_pass(clone: Path):
+def test_run2_unit_shape_does_not_pass(clone: Path):
     unit = _unit(
         P("file_exists", {"path": "notes.md"}),
-        P("file_contains", {"path": "notes.md", "text": "## Widget inventory"}),
+        P("file_contains", {"path": "notes.md", "text": "## Pin inventory"}),
         P("exit_code", {"code": 0}),
     )
     assert validate(unit.predicates) == []
@@ -105,7 +105,7 @@ def test_malformed_predicates_are_rejected(predicate: P, message: str):
 def test_a_fully_satisfied_unit_passes(clone: Path):
     unit = _unit(
         P("file_exists", {"path": "notes.md"}),
-        P("file_contains", {"path": "notes.md", "text": "about widgets"}),
+        P("file_contains", {"path": "notes.md", "text": "about pins"}),
         P("exit_code", {"code": 0}),
         P("command", {"cmd": "test -f notes.md"}),
         P("command", {"cmd": "exit 3", "expect_exit": 3}),
@@ -132,7 +132,7 @@ def test_a_path_escaping_the_clone_is_ungradeable(clone: Path, tmp_path: Path):
         verdict = grade(unit, clone, 0)
         assert verdict.ungradeable_ids == ["p1", "p2"] and verdict.passed is False, path
     assert all("symlink" in note for note in verdict.notes.values())
-    assert grade(_unit(P("file_contains", {"path": "./notes.md", "text": "widgets"})), clone, 0).passed is True
+    assert grade(_unit(P("file_contains", {"path": "./notes.md", "text": "pins"})), clone, 0).passed is True
 
 
 def test_over_bound_and_undecodable_files_are_ungradeable(clone: Path):
@@ -213,7 +213,7 @@ def test_a_gitignored_path_is_ungradeable_for_both_file_kinds(clone: Path):
         verdict = grade(unit, clone, 0)
         assert (verdict.ungradeable_ids, verdict.passed) == (["p1", "p2"], False), path
         assert all(reason in note for note in verdict.notes.values()), path
-    tracked = _unit(P("file_exists", {"path": "build/kept.txt"}), P("file_contains", {"path": "notes.md", "text": "widgets"}))
+    tracked = _unit(P("file_exists", {"path": "build/kept.txt"}), P("file_contains", {"path": "notes.md", "text": "pins"}))
     assert grade(tracked, clone, 0).passed is True
 
 

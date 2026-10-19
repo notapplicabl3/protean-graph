@@ -3,6 +3,8 @@ __pycache__/
 .ruff_cache/
 .venv/
 .DS_Store
+# the operator's profile; the tracked operator.example.json beside it is what a fresh clone runs on
+brain/protean/operator.json
 # brain/protean — runtime state beside the tracked prompts and config
 brain/protean/state/
 brain/protean/mailbox/
