@@ -28,3 +28,7 @@ testpaths = ["tests"]
 # tests/protean/ is a package named like the source package; importlib mode keeps
 # `import protean` resolving to src/protean instead of the tests directory.
 addopts = "--import-mode=importlib --strict-markers"
+
+[tool.run_checks]
+# The maintainer's run_checks runner: the battery outruns the runner's 60 s default (the spec's bound is 120 s; the measured time lives in docs/STATE.md).
+timeout = 120

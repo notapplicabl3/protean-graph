@@ -14,13 +14,14 @@ import json
 import re
 from collections.abc import Callable
 from dataclasses import asdict, dataclass, field
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-from protean.graph import budget, grade
+from protean.graph import budget, grade, graph, memory
 from protean.graph.budget import Caps
 from protean.operator import Operator, load_operator
-from protean.runner import (Charge, Runner, RunResult, cap_bound, charged_cap, floor_reason, no_charge, usd_cap,
+from protean.runner import (NO_MCP, Charge, Runner, RunResult, cap_bound, charged_cap, floor_reason, no_charge, usd_cap,
                             usd_left)
 from protean.state import (DIRECTOR, LOCK, MOVE_KINDS, Idea, Move, OpenItem, Predicate, Root, Task, Unit,
                            predicate_view, save)
@@ -88,12 +89,14 @@ def last_answer(task: Task) -> dict[str, str] | None:
     return {"id": asked[-1].id, "question": asked[-1].text, "answer": asked[-1].answer}
 
 
-def thinker_message(task: Task, caps: Caps, notes: list[str], operator: dict[str, str] | None = None) -> dict[str, Any]:
+def thinker_message(task: Task, caps: Caps, notes: list[str], operator: dict[str, str] | None = None,
+                    memory: list[dict[str, Any]] | None = None) -> dict[str, Any]:
     """What the thinker is shown each call: the thought record (thought, standing, open, decided),
     every thought in order, the units with their statuses and the worker's summaries, the moves, the budget left for
     the session (its allowance less its cost), the notes the loop passes, and the operator's answer
     to its last `ask`. Built from the record and `notes` alone, so no runtime question or answer, transcript line
-    or reader exchange is ever in it."""
+    or reader exchange is ever in it. `memory`, when non-empty, is the brain's long-term memory of earlier sessions on
+    the project (`memory.recall`), carried as is."""
     message: dict[str, Any] = {
         "thought": task.thought,
         "standing": task.standing,
@@ -113,14 +116,35 @@ def thinker_message(task: Task, caps: Caps, notes: list[str], operator: dict[str
     answer = last_answer(task)
     if answer is not None:
         message["answer"] = answer
+    if memory:
+        message["memory"] = memory
     return message
 
 
-def argv(task: Task, caps: Caps, root: Root, session: str | None, spent: float = 0.0) -> list[str]:
-    """The thinker's call: no user settings, read-only tools on the workspace, the prompt on every call, resumed when
-    it can be."""
+STRETCH_SECONDS = 3600  # the prompt cache's hour: a thinker call this soon after the last resumes its session
+
+
+def warm(task: Task, now: datetime | None = None) -> bool:
+    """Whether the thinker's session is still a warm stretch: its last call returned under `STRETCH_SECONDS` ago.
+    The session owns its short-term memory (the operator, 2026-10-22: the brain the long-term, the thinking session
+    the short-term): within a stretch the seat resumes and keeps its own reasoning; after a rest, an ask or any wait
+    past the hour it starts fresh on the record, since a cold resume re-writes the whole context for nothing."""
+    if not task.director_session or not task.director_called_at:
+        return False
+    try:
+        last = datetime.fromisoformat(task.director_called_at)
+    except ValueError:
+        return False
+    now = now or datetime.now(timezone.utc)
+    return (now - last).total_seconds() < STRETCH_SECONDS
+
+
+def argv(task: Task, caps: Caps, root: Root, spent: float = 0.0, session: str | None = None) -> list[str]:
+    """The thinker's call: no user settings, no MCP servers, read-only tools on the workspace, the prompt on every
+    call; `session` resumes the seat's own session (a warm stretch, `warm`), else the call is a fresh session whose
+    whole memory is the thought record in the message."""
     args = [
-        "claude", "-p", "--setting-sources", "", "--output-format", "json",
+        "claude", "-p", "--setting-sources", "", *NO_MCP, "--output-format", "json",
         "--max-budget-usd", usd_cap(caps.director_call_usd, task, caps, spent),
         "--model", caps.director_model, "--permission-mode", "dontAsk", "--tools", *TOOLS, "--allowedTools", *TOOLS,
         "--add-dir", task.workspace,
@@ -348,7 +372,8 @@ _SENTENCE_END = re.compile(r"(?<=[.!?])\s+")
 class MoveReply:
     """One decoded thinker answer: exactly one move (`kind`, one of `MOVE_KINDS`) and the `state` it leaves, its
     `standing` stripped and its `open` items. The move's content sits in the field its kind uses: `ideas`, `brief`
-    (explore), `units` (task, every one `pending`) or `question` (ask); a rest carries none."""
+    (explore), `units` (task, every one `pending`) or `question` (ask); a rest carries none. `fire` is the firing set,
+    derived from the kind (`graph.FIRES`) when none is given: the reply on the wire stays one move."""
 
     kind: str
     standing: str
@@ -357,6 +382,11 @@ class MoveReply:
     brief: str = ""
     units: list[Unit] = field(default_factory=list)
     question: str = ""
+    fire: list[str] = field(default_factory=list)
+
+    def __post_init__(self) -> None:
+        if not self.fire:
+            self.fire = graph.fires(self.kind)
 
 
 def _one_line(value: object) -> str | None:
@@ -470,7 +500,9 @@ def _decode_one(kind: str, value: object, task: Task, open_items: list[OpenItem]
 def decode_move(text: str, task: Task) -> tuple[MoveReply | None, list[str]]:
     """Decode a thinker reply against the task: exactly one of the five moves plus `state`, nothing else. Any other
     shape returns every problem found, for the retry with its errors (the same path as a malformed plan); `decided`
-    and `moves` are the brain's, and the reply never sets a unit's status."""
+    and `moves` are the brain's, and the reply never sets a unit's status. The move's firing set (`MoveReply.fire`) is
+    checked against the registry (`graph.firing_errors`): exactly one firing, of a node the thinker may fire. A key
+    that names a node only the runtime fires (the reader, the grader, save) says so beside its drop."""
     obj, problem = first_object(text)
     if obj is None:
         return None, [problem or "the reply holds no JSON object"]
@@ -482,12 +514,14 @@ def decode_move(text: str, task: Task) -> tuple[MoveReply | None, list[str]]:
     extra = [key for key in obj if key not in MOVE_KINDS and key != "state"]
     if extra:
         errors.append(f"the reply carries one move and state only; drop {', '.join(map(repr, extra))}")
+        errors += [error for key in extra if any(n.fired_by == graph.RUNTIME for n in graph.named(key))
+                   for error in graph.firing_errors([key])]
     standing, open_items, state_errors = _decode_state("state" in obj, obj.get("state"))
     errors += state_errors
     reply = None
     if len(moves) == 1:
         reply, move_errors = _decode_one(moves[0], obj[moves[0]], task, open_items)
-        errors += move_errors
+        errors += move_errors + graph.firing_errors(reply.fire)
     if errors or reply is None:
         return None, errors
     reply.standing, reply.open = standing, open_items or []
@@ -581,8 +615,9 @@ def next_move(task: Task, caps: Caps, root: Root, runner: Runner, charge: Charge
     notes = pending_notes(root, task.id)
     with LOCK:  # counted under the lock a console think lands under: the thoughts the message carries, no more
         seen = len(task.thoughts)
-        message = json.dumps(thinker_message(task, caps, notes, load_operator(root).as_message()), indent=2)
-    session, cost, errors, raw = task.director_session, 0.0, [], ""
+        message = json.dumps(thinker_message(task, caps, notes, load_operator(root).as_message(),
+                                             memory.recall(root, task.project, task.id)), indent=2)
+    session, cost, errors, raw = (task.director_session if warm(task) else None), 0.0, [], ""
     for attempt in range(2):
         stdin = message
         clip = budget.call_caps(task, caps)  # what the allowance has left bounds this call
@@ -595,7 +630,7 @@ def next_move(task: Task, caps: Caps, root: Root, runner: Runner, charge: Charge
         call = record = None
         bound, left = cap_bound(caps.director_call_usd, task, clip, cost), usd_left(task, clip, cost)
         try:
-            call = argv(task, clip, root, session, cost)
+            call = argv(task, clip, root, cost, session)
             record = budget.open_call(task, "director", attempt + 1, charged_cap(call), stdin)
             save(root, task)
             res = runner(call, stdin, seat, caps.director_wall_seconds)
@@ -605,9 +640,14 @@ def next_move(task: Task, caps: Caps, root: Root, runner: Runner, charge: Charge
             charge(cost + (charged_cap(call) if call else float(usd_cap(caps.director_call_usd, task, clip, cost))))
             raise
         receipt, errors = _receipt(res, caps.director_wall_seconds)
-        charged = charged_cap(call) if receipt is None else budget.cost_of(receipt)
+        before = None
+        if receipt is None:
+            charged = charged_cap(call)
+        else:  # a resumed session's receipt is cumulative: this call is charged what it added
+            charged, before = budget.call_cost(task, receipt, record)
+            task.director_called_at = datetime.now(timezone.utc).isoformat(timespec="seconds")
         cost += charged
-        budget.resolve(record, charged, receipt, timed_out=res.timed_out)
+        budget.resolve(record, charged, receipt, timed_out=res.timed_out, before=before)
         save(root, task)
         if receipt is None:  # no receipt: never retried, the loop holds paid work on the record's UNKNOWN spend
             return Reply(unreceipted=errors[0], errors=errors, cost_usd=cost, session_id=session, raw=res.stdout[-2000:])

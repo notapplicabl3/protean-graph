@@ -66,4 +66,4 @@ The renaming was consistent: the operator's name (including the `operator_answer
 
 ## Status
 
-Retired. Built and dry-proven; the live gates it was waiting on were never opened, and its completion signal was shown untrustworthy, which is what prompted the rewrite at the repository root. **Last updated: 2026-10-18.**
+Retired. Built and dry-proven; the live gates it was waiting on were never opened, and its completion signal was shown untrustworthy, which is what prompted the rewrite at the repository root. **Last updated: 2026-10-27.**

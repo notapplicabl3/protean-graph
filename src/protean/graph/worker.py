@@ -41,7 +41,7 @@ from pathlib import Path
 
 from protean.graph import budget, grade
 from protean.graph.budget import Caps
-from protean.runner import Charge, LineSink, Runner, RunResult, charged_cap, launch, no_charge, usd_cap
+from protean.runner import NO_MCP, Charge, LineSink, Runner, RunResult, charged_cap, launch, no_charge, usd_cap
 from protean.state import Call, Move, Root, Task, Unit, append_transcript, save
 
 SANDBOX = "sandbox-exec"
@@ -86,6 +86,33 @@ def git(args: list[str], cwd: Path) -> str:
                           env=grade.git_env())
     if proc.returncode != 0:
         raise WorkerError(f"git {' '.join(args)}: {proc.stderr.strip()}")
+    return proc.stdout
+
+
+def changed_paths(workspace: Path, base: str, ref: str, present_only: bool = False) -> list[str]:
+    """The paths `ref` changed since `base`, as the tree names them: `git diff --name-only -z`, NUL-separated, so a
+    non-ASCII or quoted name arrives verbatim (without `-z` git quotes it, and a quoted name resolves to nothing).
+    `present_only` leaves out what the branch deleted (`--diff-filter=d`): a deletion is no document (the operator,
+    2026-10-22); delivery keeps every change, a unit that only deletes delivered something."""
+    flags = ["--diff-filter=d"] if present_only else []
+    return [p for p in git(["diff", "--name-only", "-z", *flags, f"{base}..{ref}"], workspace).split("\0") if p]
+
+
+def present_paths(workspace: Path, tip: str, paths: list[str]) -> list[str]:
+    """Those of `paths` that `tip` holds, in `paths`' order: an explore's paths are recorded at landing from every change,
+    so one deleted on the branch is dropped here, at the tip (`git ls-tree -z --name-only`)."""
+    if not paths:
+        return []
+    held = set(git(["ls-tree", "-z", "--name-only", tip, "--", *paths], workspace).split("\0"))
+    return [p for p in paths if p in held]
+
+
+def git_bytes(args: list[str], cwd: Path) -> bytes:
+    """`git` as `git` runs it, hardened the same way, its stdout as bytes (a blob carries NUL and non-UTF-8 bytes); a
+    failure raises `WorkerError` with git's own message."""
+    proc = subprocess.run(["git", *grade.GIT_HARDENING, *args], cwd=cwd, capture_output=True, env=grade.git_env())
+    if proc.returncode != 0:
+        raise WorkerError(f"git {' '.join(args)}: {proc.stderr.decode('utf-8', 'replace').strip()}")
     return proc.stdout
 
 
@@ -159,7 +186,7 @@ def argv(task: Task, caps: Caps, root: Root, clone: Path, sandbox: str, unit: Un
     per-call dollar cap, the prompt."""
     return [
         sandbox, "-p", sandbox_profile(clone, root.console_file(task.id)),
-        "claude", "-p", "--setting-sources", "", "--output-format", "stream-json", "--verbose",
+        "claude", "-p", "--setting-sources", "", *NO_MCP, "--output-format", "stream-json", "--verbose",
         "--max-budget-usd", usd_cap(caps.worker_call_usd, task, caps),
         "--model", caps.worker_model, "--permission-mode", "dontAsk", "--allowedTools", *TOOLS, *check_grants(unit),
         "--system-prompt", root.editor_prompt.read_text(encoding="utf-8"),
@@ -359,7 +386,7 @@ def run_unit(task: Task, unit: Unit, caps: Caps, root: Root, runner: Runner, cha
             fetched = False
         if fetched:  # read in the workspace, from the fetched objects: never the editor's own `.git`
             try:
-                changed = git(["diff", "--name-only", f"{base}..{ref}"], workspace).splitlines()
+                changed = changed_paths(workspace, base, ref)
             except WorkerError:
                 changed = []
             try:
@@ -439,7 +466,7 @@ def run_explore(task: Task, move: Move, caps: Caps, root: Root, runner: Runner,
         try:
             git(["fetch", "--quiet", "--no-tags", str(clone), f"+{branch}:{branch}"], workspace)
             candidate = git(["rev-parse", "--verify", ref], workspace).strip()
-            changed = git(["diff", "--name-only", f"{base}..{ref}"], workspace).splitlines()
+            changed = changed_paths(workspace, base, ref)
             fetched = True
         except WorkerError as exc:
             problems.append(f"fetch into the workspace failed: {exc}")

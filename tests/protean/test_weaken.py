@@ -422,15 +422,17 @@ def test_the_weakening_call_is_clipped_and_booked_like_any_reader_call_and_none_
     runner = ScriptedRunner([], [], [READ_YES])
     check = gate.weakening(task, u2, workspace, tip, cand, {}, Caps(reader_call_usd=2.0), root, runner)
     argv = runner.calls[0][0]
-    assert argv[argv.index("--max-budget-usd") + 1] == "1.23" and (check.result, check.kind) == (
+    # the reader's own budget (2026-10-20): the $2.00 per-call cap stands whole, though the allowance has $1.23 left
+    assert argv[argv.index("--max-budget-usd") + 1] == "2.00" and (check.result, check.kind) == (
         "weakened", "weakened assertions")
     assert task.cost_usd == pytest.approx(23.82) and load(root, task.id).calls[-1].booked  # booked at once, saved
     assert (check.call.seat, check.call.unit, check.call.attempt) == ("reader", "u-2", 2)
-    task.cost_usd = 24.6
+    from protean.state import Call  # noqa: PLC0415 — one booked reader call that leaves $0.40 of the reader's budget
+    task.calls.append(Call(id="c-r", seat="reader", attempt=1, cap_usd=3.0, outcome="ok", charge_usd=6.55, booked=True))
     floor = gate.weakening(task, u2, workspace, tip, cand, {}, Caps(), root, runner)
     assert len(runner.calls) == 1 and floor.rejects and (floor.result, floor.reason, floor.call, floor.note) == (
         "unchecked", "floor", None,
-        "weakening check could not run: no reader call: max_usd: remaining $0.40 below the $0.50 call floor")
+        "weakening check could not run: no reader call: reader_max_usd: remaining $0.40 below the $0.50 call floor")
     assert _events(root, task.id, "weakening")[-1]["call"] is None
 
 

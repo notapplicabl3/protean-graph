@@ -60,6 +60,7 @@ class ScriptedRunner:
                  reader: list[dict[str, Any]] | None = None) -> None:
         self.director, self.worker, self.reader = list(director), list(worker), list(reader or [])
         self.calls: list[tuple[list[str], str | None, Path, int]] = []
+        self.spent: dict[str, float] = {}  # per session id: what its receipts have reported so far
 
     @staticmethod
     def seat(argv: list[str]) -> str:
@@ -86,7 +87,19 @@ class ScriptedRunner:
             return RunResult(-9, "", "", True)
         if "stdout" in entry:
             return RunResult(entry.get("returncode", 1), entry["stdout"], "scripted: no receipt")
-        return RunResult(0, json.dumps(entry), "")
+        return RunResult(0, json.dumps(self._cumulative(entry, argv)), "")
+
+    def _cumulative(self, entry: dict[str, Any], argv: list[str]) -> dict[str, Any]:
+        """What the CLI prints: an entry's `total_cost_usd` is the call's own spend, but a call that resumes a session
+        (`--resume <id>`, the thinker's within a warm stretch) reports the session's whole spend so far, as
+        `claude -p --resume` does."""
+        session, cost = entry.get("session_id"), float(entry.get("total_cost_usd", 0.0))
+        if not isinstance(session, str):
+            return entry
+        resumed = "--resume" in argv and argv[argv.index("--resume") + 1] == session
+        cost = self.spent.get(session, 0.0) + cost if resumed else cost
+        self.spent[session] = cost
+        return {**entry, "total_cost_usd": round(cost, 7)}
 
     @staticmethod
     def _work(entry: dict[str, Any], clone: Path) -> RunResult:

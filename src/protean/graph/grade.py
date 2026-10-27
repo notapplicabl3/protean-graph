@@ -231,6 +231,21 @@ def quoted(path: str) -> str:
     return '"' + path.replace("\\", "\\\\").replace('"', '\\"') + '"'
 
 
+def regex_quoted(pattern: str) -> str:
+    """A pattern as a sandbox-profile regex literal (`#"..."`: its backslashes reach the regex engine)."""
+    return '#"' + pattern.replace('"', '\\"') + '"'
+
+
+def temp_pattern(path: Path) -> str:
+    """The regex matching every private temp name `console._write_private` gives `path` while writing it:
+    `.<name>.<random>.tmp` in the same directory, renamed over the file once whole."""
+    specials = set(".^$*+?()[]{}|\\")
+
+    def literal(text: str) -> str:
+        return "".join("\\" + char if char in specials else char for char in text)
+    return f"^{literal(str(path.parent))}/\\.{literal(path.name)}\\.[^/]*\\.tmp$"
+
+
 def writable_trees(clone: Path) -> list[str]:
     """Where a confined process may write: the clone, uv's caches, the temp dirs and /dev, as realpaths
     (sandbox-exec matches a subpath against the realpath, so a symlink that leaves these trees is denied).
@@ -252,11 +267,21 @@ def write_clauses(clone: Path) -> str:
 
 
 def read_deny(console_file: Path | None) -> str:
-    """The clause that denies reading the task's console file (its token operates the run): shared by the editor's
-    profile and a check command's, since code the editor wrote runs under the second. Empty without a path."""
+    """The clauses that deny reading the task's console file (its token operates the run) and the root's lobby file
+    beside it (`state/lobby.json`: its token starts and resumes sessions — paid work — so an editor must never read
+    it either): shared by the editor's profile and a check command's, since code the editor wrote runs under the
+    second. Empty without a path."""
     if console_file is None:
         return ""
-    return f"(deny file-read* (literal {quoted(str(console_file.resolve()))}))"
+    lobby_file = console_file.parent.parent / "lobby.json"  # <root>/state/<task>/console.json → <root>/state/lobby.json
+    clauses = []
+    for path in (console_file.resolve(), lobby_file.resolve()):
+        # By name, and by the private temp name `console._write_private` writes it through (`.<name>.<random>.tmp`
+        # beside it, renamed over it): a reader that opened the temp file in that window would keep the token through
+        # the rename (audit 2026-10-23, C3).
+        clauses.append(f"(deny file-read* (literal {quoted(str(path))}))")
+        clauses.append(f"(deny file-read* (regex {regex_quoted(temp_pattern(path))}))")
+    return " ".join(clauses)
 
 
 def _sandbox_profile(clone: Path, console_file: Path | None = None) -> str:

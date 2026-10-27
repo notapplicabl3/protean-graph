@@ -1,5 +1,15 @@
-"""The loop: each tick asks the thinker for one move, runs one runnable unit, or runs one explore; only the grader
-passes a unit.
+"""The loop: the ring, a walker over the node registry (`graph/graph.py`). Each tick asks the thinker for one move,
+runs one runnable unit, or runs one explore; only the grader passes a unit.
+
+A tick is a walk: the entries in every tick (repair, block, budget, release, pick, hold, block again, save), the tick's
+firing and the nodes it brings, in the one order the registry's edges allow (`_walk`); each node's act (`ACTS`) may
+end the tick, and then nothing after it runs, save included. `pick` draws the tick's firing from the queue, one worker
+firing per tick (the runnable unit, else the queued explore), or with neither the runtime fires the thinker
+(`director`). The thinker's move fires one node (`Move.fire`): a `task` or an `explore` fires the worker, which waits
+in the queue for a later tick; an `ask` or `ideas` fires the console and a `rest` fires rest, both in the thinker's
+own tick, after it, with what they bring (memory's line after a rest). A worker unit brings the grader, the gate and the
+ref move, entries of the one tick that share its pass (`Tick`). The tick's firing set and the order it walked are the
+record's `fired` and one `fired` log event per tick.
 
 The thinker is the director seat in its thinking-session role (`graph/director.py`): one call, one move plus `state`.
 `ideas` and `rest` leave the session awaiting a thought (a hold at the tick boundary, like a question, until a console
@@ -30,7 +40,8 @@ stops the session on its ceiling in the save that books the call; every call is 
 
 A plan that proposes a predicate branch passes the gate (`graph/gate.py`) inside the tick that dispatches it: one
 fresh reader call per branching unit, decided once per plan by the mode its thinker call started in: from `auto` within the call's retry loop, from `hold` when the held plan is released. A held plan is
-released after the ceilings (`TICK`), and a `think` that lands during its admission call still returns it. On the
+released after the ceilings (the budget node's edge), and a `think` that lands during its admission call still
+returns it. On the
 branching unit's own candidate, once every child passes, the parents of those children are excused from the re-check
 (recorded `excused`, never a `broke`); at its integration they leave the re-check set.
 
@@ -48,20 +59,21 @@ import os
 import re
 import shutil
 import time
+import uuid
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, NamedTuple
+from typing import Any
 
 from protean import state
-from protean.graph import budget, console, director, gate, grade, questions, worker
+from protean.graph import budget, console, director, gate, grade, graph, memory, questions, worker
 from protean.graph.budget import Caps
 from protean.graph.console import Console, Notify
 from protean.runner import Charge, Runner, floor_reason
-from protean.state import (AUTO, DIRECTOR, EXPLORE, HOLD, MODES, PLAN, RETRY, RUNTIME, Call, Held, Move, Question, Root,
-                           Task, Unit)
+from protean.state import (AUTO, DIRECTOR, EXPLORE, HOLD, MODES, MOVE_KINDS, PLAN, RETRY, RUNTIME, Call, Fired, Firing,
+                           Held, Move, Question, Root, Task, Unit)
 
 Echo = Callable[[str], None]
 NOTE_LIMIT = 200
@@ -71,6 +83,11 @@ SESSION_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]*")  # a session id `protean
 # The scratch workspace's one empty commit: the brain's own, so no user hook or signing applies to it.
 SCRATCH_GIT = ["-c", "user.name=protean", "-c", "user.email=protean@protean.invalid", "-c", "commit.gpgsign=false"]
 clock: Callable[[], float] = time.monotonic  # the wall clock a tick's active time is read on (the battery scripts it)
+
+
+def walk_id() -> str:
+    """A new walk's id (`Fired.walk`): opaque, random, unique within the session."""
+    return uuid.uuid4().hex
 
 
 def _silent(_: str) -> None:
@@ -131,12 +148,17 @@ def _charger(task: Task, root: Root, seat: str, caps: Caps) -> Charge:
     return charge
 
 
-def _thinker_step(task: Task, caps: Caps, root: Root, runner: Runner) -> str:
+def _thinker_step(tick: Tick) -> str:
     """One thinker call. Branch admission is decided once, by the mode the call starts in: from `auto` a decoded
-    `task` move's branches pass the gate inside the call's retry loop (this tick); from `hold` they pass it when the
-    held plan is released. A mode switch during the call neither skips the reader nor pays it twice."""
+    `task` move's branches pass the gate inside the call's retry loop (this tick), the registry's gate node handed to
+    the call as its admit hook (its `within` edge, `graph.nested`); from `hold` they pass it when the held plan is
+    released. A mode switch during the call neither skips the reader nor pays it twice. A move whose firing runs now (a
+    `console` or `rest` firing: not `queued`) extends this tick with that firing, whose node accepts the move
+    (`_accept_fired`); a worker firing is accepted here and waits in the queue for a later tick. The tick's line, or ""
+    when the firing's node finishes it."""
+    task, caps, root, runner = tick.task, tick.caps, tick.root, tick.runner
     said: list[str] = []
-    admitted = task.mode == AUTO
+    admitted = task.mode == AUTO and graph.nested("gate", "director")
     waited: list[bool] = []
 
     def admit(units: list[Unit], spent: float) -> list[str]:
@@ -156,8 +178,27 @@ def _thinker_step(task: Task, caps: Caps, root: Root, runner: Runner) -> str:
     _book(task, root, booked, caps)
     state.append_log(root, task.id, {"event": "director", "reply": reply.kind, "cost_usd": reply.cost_usd,
                                      "session_id": reply.session_id, "raw": reply.raw[-2000:]})
-    return (f"thinker {_apply(reply, task, caps, root, admitted=admitted)} (${reply.cost_usd:.2f})"
-            + "".join(f"; {s}" for s in said))
+    tail = f" (${reply.cost_usd:.2f})" + "".join(f"; {s}" for s in said)
+    if reply.kind in MOVE_KINDS and not graph.node(reply.move.fire[0]).queued:
+        tick.accepting = (reply, admitted, tail)
+        task.fired.fire.append(Firing(reply.move.fire[0], move=_move_id(task)))
+        return ""
+    return f"thinker {_apply(reply, task, caps, root, admitted=admitted)}" + tail
+
+
+def _move_id(task: Task) -> str:
+    """The id the session's next move takes."""
+    return f"m{len(task.moves) + 1}"
+
+
+def _accept_fired(tick: Tick) -> bool:
+    """The node of this tick's console or rest firing accepts the thinker's move (`_accept`): an ask opens its
+    question, an ideas move proposes its options, a rest leaves the session waiting for a thought. The move's line
+    finishes the tick's."""
+    reply, admitted, tail = tick.accepting
+    said = _accept(reply.move, reply.cost_usd, tick.task, tick.root, admitted=admitted, seen=reply.thoughts)
+    tick.line = f"thinker {said}{tail}"
+    return False
 
 
 def _apply(reply: director.Reply, task: Task, caps: Caps, root: Root, *, admitted: bool) -> str:
@@ -206,14 +247,15 @@ def _move_line(reply: director.MoveReply) -> str:
 
 def _accept(reply: director.MoveReply, cost: float, task: Task, root: Root, *, admitted: bool,
             seen: int | None = None) -> str:
-    """Record one move and act on it; its `state` rewrites the record's `standing` and `open` (the brain alone writes
-    `moves`). `ideas` and `rest` leave the session awaiting a thought, unless a think landed during the call (more
-    thoughts than the `seen` its message carried): the next call carries it. `ask` opens
+    """Record one move, with its firing set (`fire`), and act on it; its `state` rewrites the record's `standing` and
+    `open` (the brain alone writes `moves`). `ideas` and `rest` leave the session awaiting a thought, unless a think
+    landed during the call (more thoughts than the `seen` its message carried): the next call carries it. `ask` opens
     the thinker's question; a `task` move's units start pending, or its plan waits for `approve` in `hold` (and for its
     admission when it branches and its call did not admit it: the call started in `hold`); an `explore` is queued for
     the next tick, held for `approve` in `hold`. Saved, then logged: the kind's own event, then `thought`, the record's
-    change."""
-    move = Move(id=f"m{len(task.moves) + 1}", kind=reply.kind, line=_move_line(reply), cost_usd=cost)
+    change. The thinker node calls it for a worker firing, which is queued; the console and rest nodes call it for
+    theirs, in the same tick (`_accept_fired`); a rest's memory line is the memory node's, after it (`_remember`)."""
+    move = Move(id=_move_id(task), kind=reply.kind, line=_move_line(reply), cost_usd=cost, fire=list(reply.fire))
     task.moves.append(move)
     task.standing, task.open = reply.standing, list(reply.open)
     events: list[dict[str, Any]] = []
@@ -256,6 +298,15 @@ def _accept(reply: director.MoveReply, cost: float, task: Task, root: Root, *, a
     return f"{move.id} {said}"
 
 
+def _remember(task: Task, root: Root) -> None:
+    """The memory node after a rest: the brain's long-term memory of the project gains one line for the record as the
+    rest left it, and its `memory` event follows the rest's (none for a scratch session)."""
+    with state.LOCK:
+        remembered = memory.logged(root, task, "rest")
+        if remembered is not None:
+            state.append_log(root, task.id, remembered)
+
+
 def _hold_for_approve(task: Task, held: Held, root: Root) -> str:
     """`hold` mode: a `task` move's plan (its units kept outside the session), a unit's retry or an explore waits for
     `approve`. Saved before it is logged, so `approve` finds it on disk. It records how many thoughts the session had
@@ -273,13 +324,15 @@ def _release_plan(task: Task, caps: Caps, root: Root, runner: Runner, echo: Echo
     """A held plan released by `approve` (or by `auto`) passes the gate first, in this tick, unless its thinker call
     already admitted it (`admitted`): admitted, its units enter the task; refused, it is dropped, none of its units
     enter, and the refusal line reaches the thinker's next message; stopped at the call floor between two admission
-    calls, it stays held (approved) and the next tick's ceiling stops the task. The plan stays held (approved) while
+    calls, it stays held (approved) and the next tick's ceiling stops the task; held on `reader_cap`, it stays held
+    until the answer, which this release then acts on (`questions.owed`: `yes` re-asks, `no` refuses). The plan stays held (approved) while
     the reader runs, so a kill meanwhile releases it again on resume, and a `think` meanwhile returns it
     (`_release`)."""
     if not task.held.admitted:
+        answered = questions.owed(task, "admission")
         admission = gate.admit(task, task.held.units, budget.call_caps(task, caps), root, runner,
                                charge=_charger(task, root, "reader", caps),
-                               to_director=True)
+                               to_director=True, answered=answered)
         for line in admission.lines:
             echo(line)
         if admission.waits:
@@ -369,6 +422,7 @@ def _returned(task: Task, held: Held) -> dict[str, Any]:
     task.held = None
     if held.kind == PLAN:
         _mark(task, held.move, "returned")
+        _drop_reader_caps(task, held)
         note = (f"The operator added a thought while your plan ({', '.join(u.id for u in held.units)}) waited for their "
                 "approval: it was returned with their thoughts and none of its units entered the session. Move again "
                 "under the thoughts.")
@@ -384,6 +438,18 @@ def _returned(task: Task, held: Held) -> dict[str, Any]:
                 f"retry was returned with their thoughts and did not run, so {held.unit} is failed as it stands. Give "
                 "its work again in a new task, smaller, or explore what stopped it.")
     return {"event": "returned", **console.held_event(held), "thoughts": len(task.thoughts), "to_director": note}
+
+
+def _drop_reader_caps(task: Task, held: Held) -> None:
+    """A returned plan takes its `reader_cap` admission questions with it: an open one is superseded (`returned`), an
+    answered one is never acted on."""
+    ids = {unit.id for unit in held.units}
+    for question in task.questions:
+        info = question.context.get("reader_cap") if question.reason == "reader_cap" else None
+        if info and info["check"] == "admission" and info["unit"] in ids and not question.context.get("settled"):
+            question.context["settled"] = True
+            if question.status == "open":
+                question.status, question.disposition = "superseded", "returned"
 
 
 def _rechecks(task: Task, clone: Path, root: Root,
@@ -434,8 +500,13 @@ def _integrate(task: Task, unit: Unit, root: Root) -> bool:
 
 
 def _repair(task: Task, root: Root) -> bool:
-    """Finish every pass a kill cut between its two writes; the unit's worker never runs again.
-    False when a tip moved outside the loop leaves a pass unfinished."""
+    """Finish every pass a kill cut between its two writes; the unit's worker never runs again. Write once the memory
+    line of a rest whose memory node a kill cut off, and log its `memory` event (`memory.owed`; the memory node stays
+    the line's writer, this is the net under it). False when a tip moved outside the loop leaves a pass unfinished."""
+    with state.LOCK:
+        remembered = memory.owed(root, task)
+        if remembered is not None:
+            state.append_log(root, task.id, remembered)
     for unit in task.units:
         if unit.status == "passed" and unit.candidate and not unit.integrated and not _integrate(task, unit, root):
             return False
@@ -476,25 +547,29 @@ def _earlier_verdict(root: Root, task: Task, unit: Unit) -> dict[str, Any] | Non
     return earlier[-1] if earlier else None
 
 
-def _worker_step(task: Task, unit: Unit, caps: Caps, root: Root, runner: Runner) -> str:
+def _work(tick: Tick) -> None:
+    """The worker on the picked unit: one attempt in its clone, its spend booked on the session and on the task move
+    the unit came from. What the pass's later nodes need (the result, the accepted tip it branched from) stays in the
+    tick."""
+    task, unit, caps, root = tick.task, tick.unit, tick.caps, tick.root
     unit.attempts += 1
     findings = worker.findings(task, unit, _earlier_verdict(root, task, unit))
-    res = worker.run_unit(task, unit, budget.call_caps(task, caps), root, runner, _charger(task, root, "worker", caps),
-                          findings=findings)
-    tip = task.accepted  # the accepted tip the unit branched from: nothing integrates between its clone and its grade
+    res = worker.run_unit(task, unit, budget.call_caps(task, caps), root, tick.runner,
+                          _charger(task, root, "worker", caps), findings=findings)
+    tick.tip = task.accepted  # the tip the unit branched from: nothing integrates between its clone and its grade
     task.cost_usd += res.cost_usd
     for move in task.moves:  # the task move the unit came from carries its workers' spend
         if move.kind == "task" and unit.id in move.units:
             move.cost_usd += res.cost_usd
     _book(task, root, budget.mark_booked(task), caps)
-    rechecked, graded, weakening = None, res.delivered and res.exit_code == 0, None
-    if graded:
-        verdict, broke, rechecked, weakening = _grade(task, unit, res, tip, caps, root, runner)
-    elif res.delivered:
-        reported = f"exit_code {res.exit_code}" if res.exit_code is not None else "no exit_code line"
-        verdict, broke = grade.ungradeable(unit, f"the worker reported {reported}; nothing was graded"), {}
-    else:
-        verdict, broke = grade.ungradeable(unit, res.delivery_note), {}
+    tick.res = res
+
+
+def _conclude(task: Task, unit: Unit, res: worker.WorkerResult, caps: Caps, root: Root, verdict: grade.Verdict,
+              broke: dict[str, str], rechecked: list[dict[str, Any]] | None, weakening: gate.Weakening | None,
+              graded: bool) -> str:
+    """Decide one graded (or ungradeable) attempt: passed, or rejected (failed after the last), its `verdict` logged,
+    saved, and a pass integrated; the tick's line."""
     passed = verdict.passed and not broke and not (weakening is not None and weakening.rejects)
     if passed:
         unit.status, unit.candidate = "passed", res.candidate
@@ -536,30 +611,69 @@ def _worker_step(task: Task, unit: Unit, caps: Caps, root: Root, runner: Runner)
     return f"{unit.id} attempt {unit.attempts}: {unit.status}{detail} (${res.cost_usd:.2f})" + _reader_said(weakening)
 
 
-def _grade(task: Task, unit: Unit, res: worker.WorkerResult, tip: str, caps: Caps, root: Root,
-           runner: Runner) -> tuple[grade.Verdict, dict[str, str], list[dict[str, Any]] | None, gate.Weakening | None]:
-    """A delivered candidate's checks, all in the grading clone (`worker.grading_clone`: a fresh clone of the workspace
-    at the candidate, removed afterwards), never in the editor's own clone: its own grade, the re-checks and the clean
-    clone, then, once every free check passed, the weakening check. (verdict, broke, re-checked, weakening)."""
+def _grade(task: Task, unit: Unit, res: worker.WorkerResult,
+           root: Root) -> tuple[grade.Verdict, dict[str, str], list[dict[str, Any]] | None, dict[str, list[str]],
+                                Path | None]:
+    """A delivered candidate's free checks, all in the grading clone (`worker.grading_clone`: a fresh clone of the
+    workspace at the candidate), never in the editor's own clone: its own grade, the re-checks and the clean clone.
+    (verdict, broke, re-checked, excused, the clone): the clone is kept for the gate's weakening check, which removes
+    it, and is None, already removed, when it could not be prepared, when a check left it changed, or on any exception
+    here."""
     console_file = root.console_file(task.id)
     try:
         clone = worker.grading_clone(task, root, res.candidate)
     except worker.WorkerError as exc:
-        return grade.ungradeable(unit, f"the grading clone could not be prepared: {exc}"), {}, None, None
+        return grade.ungradeable(unit, f"the grading clone could not be prepared: {exc}"), {}, None, {}, None
     try:
         verdict = grade.grade(unit, clone, res.exit_code, console_file=console_file)
         excused = gate.excused(unit, verdict.passed_ids)
         broke, rechecked = _rechecks(task, clone, root, excused) if verdict.passed else ({}, None)
         tampered = worker.clone_changes(clone, res.candidate, console_file)
-        if tampered:
-            return grade.ungradeable(unit, tampered), {}, None, None
-        weakening = None
-        if verdict.passed and not broke:  # every free check passed: only now the paid one
-            weakening = gate.weakening(task, unit, clone, tip, res.candidate, excused, budget.call_caps(task, caps),
-                                       root, runner, charge=_charger(task, root, "reader", caps))
-        return verdict, broke, rechecked, weakening
+    except BaseException:
+        shutil.rmtree(clone, ignore_errors=True)
+        raise
+    if tampered:
+        shutil.rmtree(clone, ignore_errors=True)
+        return grade.ungradeable(unit, tampered), {}, None, {}, None
+    return verdict, broke, rechecked, excused, clone
+
+
+def _attempt_record(res: worker.WorkerResult, verdict: grade.Verdict, rechecked: list[dict[str, Any]] | None,
+                    excused: dict[str, list[str]]) -> dict[str, Any]:
+    """What finishing an attempt held on `reader_cap` needs, kept in the question's context: the worker's result (its
+    clone is gone), its own grade, the re-checks and the excused parents, all of which passed."""
+    return {"worker": {key: value for key, value in asdict(res).items() if key != "clone"},
+            "grade": asdict(verdict), "recheck": rechecked, "excused": excused}
+
+
+def _answered_weakening(task: Task, question: Question, caps: Caps, root: Root, runner: Runner) -> str:
+    """Act once on the answer to a weakening check held on `reader_cap`. `yes`: the reader is asked once more under
+    the wider cap, in a fresh grading clone at the candidate (`gate.weakening`), and its verdict decides the attempt,
+    or a cap hit there holds it again on a new question; `no`: the attempt is rejected as a cap hit rejected it
+    (`gate.declined`). The free checks are the held attempt's own, never run again."""
+    info = question.context["reader_cap"]
+    unit = next(u for u in task.units if u.id == info["unit"])
+    res = worker.WorkerResult(clone=root.clones_dir(task.id).resolve() / unit.id, **info["worker"])
+    verdict, rechecked = grade.Verdict(**info["grade"]), info["recheck"]
+    if question.disposition != "reasked":
+        weakening = gate.declined(task, unit, question, root)
+        return _conclude(task, unit, res, caps, root, verdict, {}, rechecked, weakening, True)
+    try:
+        clone = worker.grading_clone(task, root, res.candidate)
+    except worker.WorkerError as exc:
+        question.context["settled"] = True
+        verdict = grade.ungradeable(unit, f"the grading clone could not be prepared: {exc}")
+        return _conclude(task, unit, res, caps, root, verdict, {}, None, None, True)
+    try:
+        weakening = gate.weakening(task, unit, clone, info["accepted_tip"], res.candidate, info["excused"],
+                                   budget.call_caps(task, caps), root, runner,
+                                   charge=_charger(task, root, "reader", caps), answered=question,
+                                   attempt=_attempt_record(res, verdict, rechecked, info["excused"]))
     finally:
         shutil.rmtree(clone, ignore_errors=True)
+    if weakening.result == gate.HELD:
+        return f"{unit.id} attempt {unit.attempts}: held again, the reader reached its cap" + _reader_said(weakening)
+    return _conclude(task, unit, res, caps, root, verdict, {}, rechecked, weakening, True)
 
 
 def _reader_said(weakening: gate.Weakening | None) -> str:
@@ -595,6 +709,7 @@ def _explore_step(task: Task, move: Move, caps: Caps, root: Root, runner: Runner
     task.cost_usd += res.cost_usd
     move.cost_usd += res.cost_usd
     move.report = res.summary
+    move.paths = res.changed  # the explore's own changes (from its base), read in the workspace: the console's artifacts
     move.outcome = ("landed" if res.delivered else "not fetched") + (f": {res.delivery_note}"[:NOTE_LIMIT]
                                                                    if res.delivery_note else "")
     shutil.rmtree(res.clone, ignore_errors=True)
@@ -614,8 +729,13 @@ def ceiling(task: Task, caps: Caps) -> str | None:
 
 @dataclass
 class Tick:
-    """What one tick's steps share: the tick's arguments, the unit `pick` chose or, with none, the explore it chose
-    (both None: the thinker's turn), the line the seat returned and when the tick started (`clock`)."""
+    """What one tick's nodes share: the tick's arguments and when it started (`clock`); the unit `pick` drew or, with
+    none, the explore it drew (both None: the thinker's turn); the thinker move whose console or rest firing runs in
+    this tick (`accepting`: the reply, whether its call admitted its branches, the line's tail); the pass that worker
+    → grader → gate → ref share (the worker's result, the accepted tip it branched from, the verdict, the broken
+    retained predicates, the re-checks, the excused parents, the grading clone until the gate removes it, the weakening
+    check); the line the tick echoes; and `adds`, the nodes the runtime fired into the tick beyond its firings (the
+    thinker)."""
 
     task: Task
     caps: Caps
@@ -626,30 +746,44 @@ class Tick:
     explore: Move | None = None
     line: str = ""
     started: float = 0.0
-
-
-class Step(NamedTuple):
-    """One named step of the tick order; `act` returns True when the tick ends there."""
-
-    name: str
-    act: Callable[[Tick], bool]
+    adds: list[str] = field(default_factory=list)
+    accepting: tuple[director.Reply, bool, str] | None = None
+    res: worker.WorkerResult | None = None
+    tip: str | None = None
+    graded: bool = False
+    verdict: grade.Verdict | None = None
+    broke: dict[str, str] = field(default_factory=dict)
+    rechecked: list[dict[str, Any]] | None = None
+    excused: dict[str, list[str]] = field(default_factory=dict)
+    clone: Path | None = None
+    weakening: gate.Weakening | None = None
 
 
 def _repair_step(tick: Tick) -> bool:
-    """Finish every cut pass. The tick ends here when one stays cut, the session is terminal, a question is open,
-    something waits for `approve` or the session awaits a thought."""
+    """Finish every cut pass and a rest's cut memory line (`_repair`). The tick ends here when a pass stays cut, the
+    session is terminal, a question is open, something waits for `approve` or the session awaits a thought."""
     task = tick.task
     return (not _repair(task, tick.root) or task.terminal is not None or bool(state.open_questions(task))
             or _awaits_approve(task) or task.awaiting_thought)
 
 
 def _release_step(tick: Tick) -> bool:
-    """A held plan that `approve` (or `auto`) released passes the gate; admitted, its units enter the task. Its reader
-    calls (booked in the gate's own save) may have reached the allowance or left it under the call floor, or left no
-    receipt: then the tick ends before any further call, on the ceiling stop or on the question."""
+    """A weakening check the operator answered on `reader_cap` is acted on first, and the tick ends there with its
+    line, saved and counted inside this node (`_answered_weakening`, then save's act, which the tick's `walked`
+    records as `save`, as the walker records every node it runs). A held plan that `approve` (or
+    `auto`) released passes the gate; admitted, its units enter the task. Its reader calls (booked in the gate's own
+    save) may have reached the allowance or left it under the call floor, or left no receipt, or held it on
+    `reader_cap`: then the tick ends before any further call, on the ceiling stop (budget's act, again) or on the
+    question."""
+    answered = questions.owed(tick.task, "weakening")
+    if answered is not None:
+        tick.line = _answered_weakening(tick.task, answered, tick.caps, tick.root, tick.runner)
+        tick.task.fired.walked.append("save")  # before its act, so its own save records it
+        _save_step(tick)
+        return True
     if tick.task.held is not None and tick.task.held.kind == PLAN:
         _release_plan(tick.task, tick.caps, tick.root, tick.runner, tick.echo)
-        return _ceiling_step(tick) or bool(state.open_questions(tick.task))
+        return _budget_step(tick) or bool(state.open_questions(tick.task))
     return False
 
 
@@ -659,7 +793,7 @@ def _block_step(tick: Tick) -> bool:
     return False
 
 
-def _ceiling_step(tick: Tick) -> bool:
+def _budget_step(tick: Tick) -> bool:
     """At a ceiling (the allowance, or the ticks) or under the call floor the session stops, and the tick ends without
     a call."""
     reason = ceiling(tick.task, tick.caps)
@@ -671,15 +805,23 @@ def _ceiling_step(tick: Tick) -> bool:
 
 
 def _pick_step(tick: Tick) -> bool:
-    """The runnable unit (units already in the session run first); else the queued explore; both None: the
-    thinker's turn."""
-    tick.unit = state.pending_unit(tick.task)
+    """Draw the tick's firing from the queue, one worker firing per tick: the runnable unit (units already in the
+    session run first), else the queued explore. With neither, the runtime fires the thinker."""
+    task = tick.task
+    tick.unit = state.pending_unit(task)
     tick.explore = None if tick.unit is not None else next(
-        (m for m in tick.task.moves if m.kind == EXPLORE and m.outcome == "pending"), None)
+        (m for m in task.moves if m.kind == EXPLORE and m.outcome == "pending"), None)
+    if tick.unit is not None:
+        move = next((m.id for m in task.moves if m.kind == "task" and tick.unit.id in m.units), None)
+        task.fired.fire.append(Firing("worker", move=move, unit=tick.unit.id))
+    elif tick.explore is not None:
+        task.fired.fire.append(Firing("worker", move=tick.explore.id))
+    else:
+        tick.adds.append("director")
     return False
 
 
-def _retry_step(tick: Tick) -> bool:
+def _hold_step(tick: Tick) -> bool:
     """A picked unit's retry, or the picked explore, runs once admitted; in `hold` it is held for `approve`, and the
     tick ends without a call."""
     if tick.explore is not None:
@@ -688,14 +830,81 @@ def _retry_step(tick: Tick) -> bool:
     return unit is not None and bool(unit.attempts) and not _retry_admitted(tick.task, unit, tick.root, tick.echo)
 
 
-def _seat_step(tick: Tick) -> bool:
-    """Work the picked unit, run the picked explore, or ask the thinker for its next move."""
-    if tick.unit is not None:
-        tick.line = _worker_step(tick.task, tick.unit, tick.caps, tick.root, tick.runner)
-    elif tick.explore is not None:
+def _director_step(tick: Tick) -> bool:
+    """Ask the thinker for its next move (`_thinker_step`)."""
+    tick.line = _thinker_step(tick)
+    return False
+
+
+def _worker_step(tick: Tick) -> bool:
+    """Run the picked explore, or one attempt of the picked unit (its grader, gate and ref move follow it)."""
+    if tick.explore is not None:
         tick.line = _explore_step(tick.task, tick.explore, tick.caps, tick.root, tick.runner)
     else:
-        tick.line = _thinker_step(tick.task, tick.caps, tick.root, tick.runner)
+        _work(tick)
+    return False
+
+
+def _grader_step(tick: Tick) -> bool:
+    """The attempt's free checks. Graded only when the worker's own closing line is `exit_code: 0` and its branch
+    carries a change; else ungradeable before any predicate is read (`_grade` for the rest)."""
+    res, unit = tick.res, tick.unit
+    tick.graded = res.delivered and res.exit_code == 0
+    if tick.graded:
+        tick.verdict, tick.broke, tick.rechecked, tick.excused, tick.clone = _grade(tick.task, unit, res, tick.root)
+    elif res.delivered:
+        reported = f"exit_code {res.exit_code}" if res.exit_code is not None else "no exit_code line"
+        tick.verdict = grade.ungradeable(unit, f"the worker reported {reported}; nothing was graded")
+    else:
+        tick.verdict = grade.ungradeable(unit, res.delivery_note)
+    return False
+
+
+def _gate_step(tick: Tick) -> bool:
+    """The gate before integration: once every free check passed, the weakening check (`gate.weakening`: one reader
+    call when the candidate touched a protected path, none otherwise) in the grading clone, which it then removes."""
+    clone, tick.clone = tick.clone, None
+    if clone is None:
+        return False
+    task, unit, res = tick.task, tick.unit, tick.res
+    try:
+        if tick.verdict.passed and not tick.broke:  # every free check passed: only now the paid one
+            tick.weakening = gate.weakening(
+                task, unit, clone, tick.tip, res.candidate, tick.excused, budget.call_caps(task, tick.caps), tick.root,
+                tick.runner, charge=_charger(task, tick.root, "reader", tick.caps),
+                attempt=_attempt_record(res, tick.verdict, tick.rechecked, tick.excused))
+    finally:
+        shutil.rmtree(clone, ignore_errors=True)
+    return False
+
+
+def _ref_step(tick: Tick) -> bool:
+    """The ref move: decide the attempt, and on a pass make its two durable writes (`_conclude`). An attempt whose
+    weakening check is held on `reader_cap` stays undecided: its clone goes, nothing is written."""
+    unit, res, weakening = tick.unit, tick.res, tick.weakening
+    if weakening is not None and weakening.result == gate.HELD:
+        shutil.rmtree(res.clone, ignore_errors=True)
+        tick.line = (f"{unit.id} attempt {unit.attempts}: held, the reader reached its cap twice (${res.cost_usd:.2f})"
+                     + _reader_said(weakening))
+        return False
+    tick.line = _conclude(tick.task, unit, res, tick.caps, tick.root, tick.verdict, tick.broke, tick.rechecked,
+                          weakening, tick.graded)
+    return False
+
+
+def _console_step(tick: Tick) -> bool:
+    """The thinker's console firing (an ask or an ideas move), accepted in its own tick (`_accept_fired`)."""
+    return _accept_fired(tick)
+
+
+def _rest_step(tick: Tick) -> bool:
+    """The thinker's rest firing, accepted in its own tick (`_accept_fired`); memory's line follows it."""
+    return _accept_fired(tick)
+
+
+def _memory_step(tick: Tick) -> bool:
+    """The memory line after a rest (`_remember`)."""
+    _remember(tick.task, tick.root)
     return False
 
 
@@ -709,7 +918,7 @@ def _task_outcomes(task: Task) -> None:
 
 def _save_step(tick: Tick) -> bool:
     """Count the tick and its active time (what `clock` read since the tick started), save the
-    session, echo the seat's line."""
+    session, echo the tick's line."""
     tick.task.tick += 1
     tick.task.active_seconds += clock() - tick.started
     _task_outcomes(tick.task)
@@ -718,27 +927,77 @@ def _save_step(tick: Tick) -> bool:
     return False
 
 
-# The tick order, declared once: `run_tick` runs exactly this, in this order. The ceilings come
-# before the release of a held plan, so an approved plan's reader call is never paid at a ceiling.
-TICK: tuple[Step, ...] = (
-    Step("repair", _repair_step),
-    Step("block", _block_step),
-    Step("ceiling", _ceiling_step),
-    Step("release", _release_step),
-    Step("pick", _pick_step),
-    Step("retry", _retry_step),
-    Step("seat", _seat_step),
-    Step("block", _block_step),
-    Step("save", _save_step),
-)
+# What each registry node does when the walker reaches it (`graph.NODES` declares the nodes and their edges; the reader
+# runs only inside the gate and the release, so it has no act of its own). An act returns True when the tick ends there.
+ACTS: dict[str, Callable[[Tick], bool]] = {
+    "repair": _repair_step, "block": _block_step, "budget": _budget_step, "release": _release_step,
+    "pick": _pick_step, "hold": _hold_step, "director": _director_step, "worker": _worker_step,
+    "grader": _grader_step, "gate": _gate_step, "ref": _ref_step, "console": _console_step, "rest": _rest_step,
+    "memory": _memory_step, "save": _save_step,
+}
+
+
+def _announced(runner: Runner, task: Task, root: Root) -> Runner:
+    """`runner`, logging one `launch` event per model call as its process is about to start. Every seat saves the
+    call's `pending` record and then hands it to the runner (director, worker, explore and reader alike), so the event
+    lands after that save: a client that refreshes on it sees the call in the snapshot's `doing`. A runner that streams
+    lines keeps doing so."""
+    def announce() -> None:
+        with state.LOCK:
+            call = task.calls[-1] if task.calls and task.calls[-1].outcome == "pending" else None
+            if call is not None:
+                state.append_log(root, task.id, {"event": "launch", "call": call.id, "seat": call.seat,
+                                                 "unit": call.unit, "attempt": call.attempt, "tick": call.tick,
+                                                 **({"walk": call.walk} if call.walk is not None else {})})
+
+    def run(argv: list[str], stdin: str | None, cwd: Path, timeout: int, **kwargs: Any) -> Any:
+        announce()
+        return runner(argv, stdin, cwd, timeout, **kwargs)
+
+    run.streams_lines = getattr(runner, "streams_lines", False)  # type: ignore[attr-defined]
+    return run
+
+
+def _walk(tick: Tick) -> Iterator[str]:
+    """The registry's walk of one tick: the entries in every tick, the nodes the runtime fired into it (`Tick.adds`),
+    its firings and the nodes each brings, in the one order their edges allow (`graph.order`). Taken again after every
+    node, since a node can add to the tick (pick draws a firing, the thinker's move adds its console or rest firing);
+    an addition that would have to run before a node already walked is refused (`graph.Unordered`). Each entry walked
+    is appended to the tick's `walked` before it runs, so a save inside it records it."""
+    walked: list[str] = []
+    while True:
+        firings = tick.task.fired.fire
+        ids = set(graph.always()) | set(tick.adds) | {f.node for f in firings}
+        ids |= {name for f in firings for name in graph.brought(f.node, f.unit)}
+        ordered = graph.order(ids)
+        if ordered[:len(walked)] != walked:
+            raise graph.Unordered(f"{', '.join(k for k in ordered if k not in walked)} entered the tick behind "
+                                  f"{walked[-1]}, which must follow it")
+        if len(ordered) == len(walked):
+            return
+        key = ordered[len(walked)]
+        walked.append(key)
+        name = graph.entries()[key].name
+        tick.task.fired.walked.append(name)
+        yield name
 
 
 def run_tick(task: Task, caps: Caps, root: Root, runner: Runner, echo: Echo = _silent) -> Task:
-    """One tick: the steps of `TICK`, in order, until one ends the tick. Its active time is read from its start."""
-    tick = Tick(task, caps, root, runner, echo, started=clock())
-    for step in TICK:
-        if step.act(tick):
-            break
+    """One tick: the registry's walk (`_walk`), each node's act (`ACTS`) in turn, until one ends the tick. The tick's
+    firing set and the order walked are the record's `fired`, rewritten here, and one `fired` event once the walk
+    ends (none when an exception cuts it). Its active time is read from its start. Every model call the tick makes
+    logs its `launch` (`_announced`). Each walk gets its own `walk` id (`walk_id`), which its calls carry; `tick` stays
+    the ticks counted, so a walk cut before its save and the walk that runs that tick again differ only in `walk`."""
+    tick = Tick(task, caps, root, _announced(runner, task, root), echo, started=clock())
+    task.fired = Fired(tick=task.tick, walk=walk_id())
+    try:
+        for name in _walk(tick):
+            if ACTS[name](tick):
+                break
+    finally:
+        if tick.clone is not None:  # a pass cut between the grader and the gate: the grading clone goes
+            shutil.rmtree(tick.clone, ignore_errors=True)
+    state.append_log(root, task.id, {"event": "fired", **asdict(task.fired)})
     return task
 
 
@@ -770,7 +1029,7 @@ def _settle(task: Task, caps: Caps, root: Root, echo: Echo) -> None:
         events = [_deliver(task, q) for q in task.questions if q.status == "answered" and q.disposition is None]
         if task.held is not None and len(task.thoughts) > task.held.directions:
             events.append(_returned(task, task.held))
-        if task.terminal == "stopped" and task.stop_reason != "abandoned" and ceiling(task, caps) is None:
+        if task.terminal == "stopped" and task.stop_reason not in ("abandoned", "closed") and ceiling(task, caps) is None:
             events.append({"event": "released", "hold": "ceiling", "reason": task.stop_reason})
             task.terminal, task.stop_reason = None, ""
         if events:
@@ -800,7 +1059,7 @@ def _hold(task: Task) -> tuple[str, ...] | None:
         return ("question", asked[0].id)
     if task.paused and task.terminal is None:
         return ("paused",)
-    if task.terminal == "stopped" and task.stop_reason != "abandoned":
+    if task.terminal == "stopped" and task.stop_reason not in ("abandoned", "closed"):
         return ("ceiling", task.stop_reason)
     if _awaits_approve(task):
         return ("held", task.held.kind)
@@ -837,6 +1096,32 @@ def _park(task: Task, hold: tuple[str, ...], caps: Caps, root: Root) -> None:
     with state.LOCK:
         state.save(root, task)
         state.append_log(root, task.id, {"event": "parked", "hold": hold[0], "on": hold[1]})
+
+
+def _mark_stopped(task: Task, root: Root, desk: Console) -> None:
+    """The console's `stop`, Ctrl-C, SIGTERM and SIGHUP all end the drive with KeyboardInterrupt (`cli._interrupt`);
+    the record then says `interrupted`, as an unattended park does, with a `parked` event (`hold` `stop`) — so a reader
+    without the process tells a stopped session from a lost brain, and `protean resume` clears it as it clears a park
+    (audit 2026-10-23, D2). The mark goes on the record AS THE TICK LAST SAVED IT, never on the loop's in-memory task:
+    that one carries what the tick has not saved yet — a unit's `attempts` counted before its clone, a verdict's
+    status before its event — and persisting it burned a unit's attempt before it ever ran (audit F1). The console then
+    serves THAT record, so the stream's last snapshot reads as `task.json` does, never the dirty copy (audit H3) — and
+    takes it the moment it is read, before the mark, so a second signal mid-mark (a double Ctrl-C, SIGTERM then
+    SIGHUP) leaves it serving the record once the read is done: after the save only the `parked` event is missing;
+    inside the save the stream says `interrupted` before disk does; during the read the loop's dirty task is still
+    what the console holds — as when the record cannot be read back at all, which marks nothing (audit I3, J1). The
+    cut call's spend is already booked (`_charger`, which saves). A record already terminal (a ceiling, `close`,
+    `abandon`) keeps its own word."""
+    with state.LOCK:
+        try:
+            disk = state.load(root, task.id)
+        except (OSError, ValueError):  # the record cannot be read back: nothing is marked; the interruption propagates
+            return
+        desk.task = disk
+        if disk.terminal is None:
+            disk.terminal = "interrupted"
+            state.save(root, disk)
+            state.append_log(root, task.id, {"event": "parked", "hold": "stop", "on": "the operator"})
 
 
 def _drive(task: Task, caps: Caps, root: Root, runner: Runner, echo: Echo, desk: Console) -> Task:
@@ -958,7 +1243,11 @@ def run(thought: str, workspace: str | Path | None, root: Root, caps: Caps, runn
             state.save(root, task)
             state.append_log(root, task.id, {"event": "pause", "actor": "console", "live": False})
         with console.serve(root, task, caps, echo, unattended, notify) as desk:
-            return _drive(task, caps, root, runner, echo, desk)
+            try:
+                return _drive(task, caps, root, runner, echo, desk)
+            except KeyboardInterrupt:
+                _mark_stopped(task, root, desk)
+                raise
 
 
 def resume(root: Root, caps: Caps, runner: Runner, extend_usd: float = 0.0, extend_ticks: int = 0,
@@ -982,17 +1271,21 @@ def resume(root: Root, caps: Caps, runner: Runner, extend_usd: float = 0.0, exte
         if session is not None:
             state.set_current(root, task_id)
         task = _prepare(state.load(root, task_id), root, caps, extend_usd, extend_ticks, abandon, echo)
-        if task.terminal == "done" or task.stop_reason == "abandoned":
+        if state.is_closed(task):
             echo(terminal_line(root, task))
             return task
         with console.serve(root, task, caps, echo, unattended, notify) as desk:
-            return _drive(task, caps, root, runner, echo, desk)
+            try:
+                return _drive(task, caps, root, runner, echo, desk)
+            except KeyboardInterrupt:
+                _mark_stopped(task, root, desk)
+                raise
 
 
 def _prepare(task: Task, root: Root, caps: Caps, extend_usd: float, extend_ticks: int, abandon: bool,
              echo: Echo) -> Task:
     """Everything a resume settles before the console serves: lost calls, an abandon, an extension, a cut pass."""
-    if task.terminal == "done" or task.stop_reason == "abandoned":
+    if state.is_closed(task):
         return task
     _recover(task, root, not abandon, caps)
     for move in task.moves:  # an explore a kill cut mid-call never runs again: no retry
@@ -1023,16 +1316,35 @@ def _prepare(task: Task, root: Root, caps: Caps, extend_usd: float, extend_ticks
 def offline_op(root: Root, caps: Caps, op: str, body: dict[str, Any]) -> dict[str, Any] | None:
     """Land a console operation straight in the current session's `task.json` when no brain drives it (the file is
     the truth): an answer, a think or an extend for a parked session, then `protean resume`. None when a brain holds
-    the session; refused (`console.Refused`) when the operation needs one."""
+    the session; refused (`console.Refused`) when the operation needs one. A think or an answer whose `request_id` the
+    record already holds returns the original event and writes nothing (`console.replayed`), as the live console
+    does, except the event itself when an earlier log append failed (`console.relog`); with another payload it is
+    refused (409). A failed save raises and lands nothing; a log append that fails after the save raises
+    `console.Unlogged`, whose message says the operation landed."""
     task = state.current(root)
     if task is None:
         raise ValueError(f"no session in {root.path}")
     try:
         with _task_lock(root, task.id):
             task = state.load(root, task.id)
+            original = console.replayed(task, op, body)
+            if original is not None:
+                try:
+                    console.relog(root, task, [console.request_id(op, body)])
+                except OSError as exc:
+                    raise console.unlogged(op, exc) from exc
+                return original
             event = console.apply(task, caps, op, body, False)
             state.save(root, task)
-            state.append_log(root, task.id, event)
+            try:
+                state.append_log(root, task.id, event)
+            except OSError as exc:
+                raise console.unlogged(op, exc) from exc
+            if op == "close":
+                remembered = memory.logged(root, task, "close")
+                if remembered is not None:
+                    state.append_log(root, task.id, remembered)
+                shutil.rmtree(root.clones_dir(task.id), ignore_errors=True)
             return event
     except TaskRunning:
         return None

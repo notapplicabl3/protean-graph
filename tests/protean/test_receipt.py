@@ -194,7 +194,8 @@ def test_a_call_killed_after_its_receipt_is_reconciled_from_it_without_holding_p
     _hard_kill(root, "after-plan", [_reply({"task": [UNIT]}, cost=0.3)])
     (call,) = load(root, task.id).calls
     assert (call.outcome, call.receipt_cost_usd, call.booked, load(root, task.id).cost_usd) == ("ok", 0.3, False, 1.0)
-    runner = ScriptedRunner([_reply({"ask": "which file?"})], [])
+    # the resumed warm session's receipt reports its whole spend so far, 0.3 + 0.1: the call is charged the 0.1 it added
+    runner = ScriptedRunner([_reply({"ask": "which file?"}, cost=0.4)], [])
     task = loop.resume(root, Caps(), runner)
     assert [q.text for q in open_questions(task)] == ["which file?"] and len(runner.calls) == 1
     assert round(task.cost_usd, 2) == round(1.0 + 0.3 + 0.1, 2)
@@ -231,12 +232,13 @@ def test_every_call_record_carries_the_receipt_fields_and_missing_tokens_are_nul
         assert call.cap_usd == float(argv[argv.index("--max-budget-usd") + 1])
         assert call.message_bytes == len(stdin.encode("utf-8"))
         assert call.tokens == NO_TOKENS
-        assert (call.outcome, call.booked, call.charge_usd) == ("ok", True, call.receipt_cost_usd)
-        assert call.actual_usd == call.receipt_cost_usd
+        assert (call.outcome, call.booked, call.charge_usd) == ("ok", True, call.actual_usd)
         assert '"cap_usd"' not in stdin and "receipt_cost_usd" not in stdin
     assert [(c.seat, c.unit, c.attempt) for c in task.calls] == [
         ("director", None, 1), ("worker", "u-1", 1), ("worker", "u-2", 1), ("director", None, 1)]
-    assert [c.receipt_cost_usd for c in task.calls] == [0.2, 0.5, 0.5, 0.1]
+    # the last call resumed the thinker's warm session: its receipt reports the session's 0.2 + 0.1, its charge the 0.1
+    assert [c.receipt_cost_usd for c in task.calls] == [0.2, 0.5, 0.5, 0.3]
+    assert [c.charge_usd for c in task.calls] == [0.2, 0.5, 0.5, 0.1]
     assert [c.session_id for c in task.calls] == ["dry-director", "dry-worker", "dry-worker", "dry-director"]
     assert sum(c.charge_usd for c in task.calls) == pytest.approx(task.cost_usd)
     logged = _calls(root, task.id)

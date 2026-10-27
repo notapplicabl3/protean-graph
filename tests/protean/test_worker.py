@@ -60,7 +60,8 @@ def test_the_clone_works_on_unit_branch_and_the_branch_lands_unmerged(ready: tup
     assert argv[:2] == [worker.sandbox_binary(), "-p"]
     assert argv[2] == worker.sandbox_profile(res.clone, root.console_file(task.id))
     assert argv[3:] == [
-        "claude", "-p", "--setting-sources", "", "--output-format", "stream-json", "--verbose", "--max-budget-usd", "4.00",
+        "claude", "-p", "--setting-sources", "", "--strict-mcp-config", "--mcp-config", '{"mcpServers":{}}',
+        "--output-format", "stream-json", "--verbose", "--max-budget-usd", "4.00",
         "--model", "claude-opus-5",
         "--permission-mode", "dontAsk", "--allowedTools", "Read", "Edit", "Write", "Grep", "Glob", "Bash(uv:*)",
         "Bash(git status:*)", "Bash(git diff:*)", "Bash(git add:*)", "Bash(git commit:*)", "Bash(git checkout:*)",
@@ -236,10 +237,10 @@ def test_real_runner_kills_the_group_when_interrupted(tmp_path: Path, monkeypatc
         raise KeyboardInterrupt
     monkeypatch.setattr(subprocess.Popen, "communicate", interrupted)
     with pytest.raises(KeyboardInterrupt):
-        real_runner(["sh", "-c", "(sleep 1; touch late) & sleep 30"], None, tmp_path, 10)
+        real_runner(["sh", "-c", "(sleep 0.5; touch late) & sleep 30"], None, tmp_path, 10)
     (proc,) = started
     assert proc.poll() is not None
-    time.sleep(1.5)
+    time.sleep(1.0)
     assert not (tmp_path / "late").exists()
 
 

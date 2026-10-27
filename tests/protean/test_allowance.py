@@ -65,8 +65,8 @@ def _events(root: Root, task_id: str, name: str) -> list[dict]:
 
 
 def _reached(task: Task, caps: Caps) -> bool:
-    """The session's spend has reached its allowance."""
-    return task.cost_usd >= budget.allowance(task, caps) - 1e-9
+    """The session's counted spend (the reader's excluded, 2026-10-20) has reached its allowance."""
+    return budget.counted_usd(task) >= budget.allowance(task, caps) - 1e-9
 
 
 class Timed:
@@ -138,9 +138,10 @@ def _accepted(root: Root, workspace: Path, files: dict[str, str], predicates: li
 def test_the_allowance_starts_at_25_accrues_10_per_1800_active_seconds_with_100_ticks_and_sitting_usd_is_unknown(
     root: Root, clock
 ):
-    shipped = load_caps(Root(DEFAULT_BRAIN))
-    for caps in (Caps(), shipped):
-        assert (caps.max_usd, caps.accrual_usd, caps.accrual_seconds, caps.max_ticks) == (25.0, 10.0, 1800, 100)
+    shipped, caps = load_caps(Root(DEFAULT_BRAIN)), Caps()
+    assert (caps.max_usd, caps.accrual_usd, caps.accrual_seconds, caps.max_ticks) == (25.0, 10.0, 1800, 100)
+    # The shipped config doubled every dollar cap 2026-10-20 (`test_reader_budget`); the defaults stay the battery's.
+    assert (shipped.max_usd, shipped.accrual_usd, shipped.accrual_seconds, shipped.max_ticks) == (50.0, 20.0, 1800, 100)
     assert not hasattr(Caps(), "sitting_usd") and clock.real is time.monotonic  # outside the battery: the wall clock
     root.path.mkdir(parents=True)
     root.config_file.write_text(json.dumps({"accrual_usd": 2.5, "accrual_seconds": 60}))
@@ -326,7 +327,9 @@ def test_an_explore_s_cap_and_the_thinker_s_are_clipped_to_the_allowance_s_left_
     assert (_argv_of(scripted, "director"), _argv_of(scripted, "worker")) == (["1.00", "1.20"], ["1.40"])
 
 
-def test_a_reader_s_cap_is_clipped_to_the_allowance_s_left_after_the_thinker_s_unbooked_spend(env: tuple[Root, Path]):
+def test_a_reader_s_cap_is_its_own_budget_s_and_its_spend_is_booked_but_not_counted(env: tuple[Root, Path]):
+    """2026-10-20: the reader's call is clipped by `reader_max_usd` less the reader's spend, never by the allowance's
+    left, and what it spends stays on the ledger without counting toward the allowance."""
     root, workspace = env
     stats = {"id": "u-1", "intent": "write stats.py",
              "predicates": [{"kind": "file_exists", "args": {"path": "stats.py"}}]}
@@ -338,10 +341,13 @@ def test_a_reader_s_cap_is_clipped_to_the_allowance_s_left_after_the_thinker_s_u
     runner = ScriptedRunner([_reply({"task": [stats]}, 0.1), _reply({"task": [branch]}, 0.1), _reply({"rest": True})],
                             [_work("stats.py", 0.5), rename], [_verdict(0.05, verdict="yes", note="carried whole")])
     task = loop.run("g", workspace, root, Caps(max_usd=1.5), runner, unattended=0.0, notify=None)
-    # $1.50 less the thinker's 0.10, u-1's 0.50 and the second thinker call's unbooked 0.10; then less the reader's 0.05
-    assert (_argv_of(runner, "reader"), _argv_of(runner, "worker")) == (["0.80"], ["1.40", "0.75"])
-    assert (task.terminal, task.stop_reason) == ("stopped", "max_usd: remaining $0.45 below the $0.50 call floor")
-    assert len(runner.director) == 1  # the rest was never asked for
+    # the reader's cap is its own ($1.50 of $7.00), while the allowance clips the workers: $1.50 less the thinker's
+    # 0.10 for u-1, then less u-1's 0.50 and the second thinker call's unbooked 0.10 — the reader's 0.05 never counts
+    assert (_argv_of(runner, "reader"), _argv_of(runner, "worker")) == (["1.50"], ["1.40", "0.80"])
+    assert _argv_of(runner, "director") == ["1.50", "0.90", "0.50"]  # the rest was asked for: $0.50 counted was left
+    assert task.cost_usd == pytest.approx(1.15) and budget.counted_usd(task) == pytest.approx(1.10)
+    assert budget.reader_usd(task) == pytest.approx(0.05) and (task.units[1].status, task.units[1].integrated) == (
+        "passed", True)
 
 
 @pytest.mark.parametrize("active, called", [(0.0, []), (36.0, ["0.60"])], ids=["under-the-floor", "accrued-past-it"])
@@ -357,10 +363,10 @@ def test_under_the_call_floor_of_the_allowance_s_left_no_call_starts_and_accrued
         assert (task.terminal, task.stop_reason) == ("stopped", "max_usd: remaining $0.40 below the $0.50 call floor")
 
 
-# --- a reader's spend reaching the allowance: the gate books it in its own save, the loop stops before any call ---
+# --- a reader's spend never reaches the allowance (2026-10-20): booked in its own save, counted nowhere ---
 
 
-def test_a_released_plan_s_reader_reaching_the_allowance_stops_the_session_before_its_worker_runs(
+def test_a_released_plan_s_reader_spending_the_allowance_s_worth_stops_nothing_and_its_worker_runs(
     env: tuple[Root, Path], saves: list[Task]
 ):
     root, workspace = env
@@ -375,20 +381,21 @@ def test_a_released_plan_s_reader_reaching_the_allowance_stops_the_session_befor
                "result": "renamed", "total_cost_usd": 0.3}
     runner = ScriptedRunner([_reply({"rest": True})], [renamed], [_verdict(1.0, verdict="yes", note="carried whole")])
     task = loop.resume(root, caps, runner, unattended=0.0, notify=None)
-    assert _seats(runner) == ["reader"] and _cap(runner.calls[0][0]) == "1.00"  # no worker call after it
-    assert (task.terminal, task.stop_reason) == ("stopped", "max_usd: 1.00 >= 1.0")
-    crossed = next(record for record in saves if _reached(record, caps))
-    assert (crossed.calls[-1].seat, crossed.terminal) == ("reader", None)  # the gate's own booking save
-    stopped = next(record for record in saves if record.terminal == "stopped")  # the release step's ceiling save
-    assert len(stopped.calls) == len(crossed.calls) == 1 and stopped.tick == 0  # nothing launched between them
-    assert [(u.id, u.attempts) for u in task.units] == [("u-1", 0), ("u-2", 0)]
+    # the reader's cap is its own budget's ($1.50 of $7.00), not the allowance's $1.00; its $1.00 is booked at once
+    # in the gate's save and never counted, so the worker runs under the whole allowance and the rest is asked for
+    assert _seats(runner) == ["reader", "worker", "director"]
+    assert [_cap(argv) for argv, _, _, _ in runner.calls] == ["1.50", "1.00", "0.70"]
+    booked = next(record for record in saves if record.calls and record.calls[0].booked)
+    assert (booked.calls[0].seat, booked.terminal, len(booked.calls)) == ("reader", None, 1)  # the gate's own save
+    assert not any(_reached(record, caps) for record in saves)  # counted spend never reached the allowance
+    assert task.cost_usd == pytest.approx(1.4) and budget.counted_usd(task) == pytest.approx(0.4)
+    assert [(u.id, u.status, u.integrated) for u in task.units] == [("u-1", "passed", True), ("u-2", "passed", True)]
+    assert task.stop_reason is None or not task.stop_reason.startswith("max_usd: 1.")
 
 
-def test_a_weakening_reader_reaching_the_allowance_stops_the_session_at_the_next_ceiling_step(
-    env: tuple[Root, Path]
-):
+def test_a_weakening_reader_spending_the_allowance_s_worth_stops_nothing(env: tuple[Root, Path]):
     root, workspace = env
-    caps = Caps(max_usd=1.1)  # the worker's $0.50 leaves $0.60: the reader's cap, and what it spends
+    caps = Caps(max_usd=1.1)  # the worker's $0.50 leaves $0.60 counted; the reader spends $0.60 of its own $7.00
     checks = Predicate("command", {"cmd": "true"}, protected=["tests"])
     task = _accepted(root, workspace, {"a.txt": "a\n", "tests/check.txt": "a\n"},
                      [Predicate("file_exists", {"path": "a.txt"}), checks])
@@ -399,9 +406,11 @@ def test_a_weakening_reader_reaching_the_allowance_stops_the_session_at_the_next
     runner = ScriptedRunner([_reply({"rest": True})], [touches],
                             [_verdict(0.6, verdict="no", kind="strengthened", note="check.txt gains a line")])
     task = loop.resume(root, caps, runner, unattended=0.0, notify=None)
-    assert _seats(runner) == ["worker", "reader"]  # no call after it
-    assert _cap(runner.calls[1][0]) == "0.60" and (task.units[1].status, task.units[1].integrated) == ("passed", True)
-    assert (task.terminal, task.stop_reason) == ("stopped", "max_usd: 1.10 >= 1.1")
+    assert _seats(runner) == ["worker", "reader", "director"]  # the rest is asked for: the reader's spend is not counted
+    assert _cap(runner.calls[1][0]) == "1.50" and (task.units[1].status, task.units[1].integrated) == ("passed", True)
+    assert _cap(runner.calls[2][0]) == "0.60"  # the thinker's cap: the allowance less the worker's 0.50 alone
+    assert task.cost_usd == pytest.approx(1.2) and budget.counted_usd(task) == pytest.approx(0.6)
+    assert task.stop_reason != "max_usd: 1.10 >= 1.1"
 
 
 # --- booking on the new seats: the record is in task.json before the runner runs ---

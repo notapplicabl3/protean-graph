@@ -27,14 +27,15 @@ import pytest
 
 from protean import cli, dry, state
 from protean.dry import REPO, ScriptedRunner, make_workspace
-from protean.graph import console, director
+from protean.graph import console, director, graph
 from protean.graph.budget import Caps
 from protean.state import (EXPLORE, RUNTIME, Decision, Held, Idea, Move, OpenItem, Root, Task, Thought, add_question,
                            load, save, set_current)
 
 TEMPLATE = REPO / "brain" / "protean"
 SNAPSHOT_KEYS = {"task", "thought", "workspace", "project", "live", "tick", "terminal", "stop_reason", "paused", "mode",
-                 "held", "awaiting_thought", "cost_usd", "ceilings", "prices", "units", "moves", "questions", "thoughts"}
+                 "held", "awaiting_thought", "doing", "fired", "cost_usd", "ceilings", "prices", "units", "moves",
+                 "artifacts", "questions", "thoughts", "capabilities", "graph"}
 
 
 def _reply(obj: dict, cost: float = 0.1) -> dict:
@@ -89,7 +90,7 @@ def test_a_think_lands_a_thought_ends_the_wait_for_one_and_logs_its_event():
     assert event == {"event": "think", "actor": "console", "live": False, "text": "go with i1", "index": 1,
                      "decide": False}
     assert [asdict(t) for t in task.thoughts] == [{"text": "go with i1", "created": "2026-10-17T10:00:00+00:00",
-                                                   "actor": "console"}]
+                                                   "actor": "console", "request_id": None}]
     assert (task.awaiting_thought, task.decided) == (False, [])
     assert console.describe(event) == "console: think #1: go with i1"
 
@@ -192,7 +193,8 @@ def test_the_snapshot_carries_the_thought_record_the_moves_the_thoughts_and_the_
                                "open": [{"id": "o1", "line": "where b.txt goes"}],
                                "decided": [{"text": "at the root", "created": "2026-10-17T09:01:00+00:00", "think": 1}]}
     assert snap["thoughts"] == [{"text": "go with i1", "created": "2026-10-17T09:01:00+00:00", "actor": "console"}]
-    assert snap["awaiting_thought"] is True
+    assert snap["awaiting_thought"] is True and snap["fired"] is None  # no tick has run on this record
+    assert len(snap["graph"]["nodes"]) == len(graph.NODES) and list(snap["graph"]["shapes"]) == list(graph.SHAPES)
     assert snap["held"] == {"kind": "explore", "approved": False, "thoughts": 1, "move": "m6", "brief": "try docs"}
     assert snap["moves"] == [
         {"id": "m1", "kind": "ideas", "line": "ideas i1, i2, i3", "cost_usd": 0.1, "outcome": "proposed",

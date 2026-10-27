@@ -74,8 +74,9 @@ def test_the_tracked_prices_reproduce_run_6_s_receipts_to_the_cent(live_receipt)
 
 def test_the_reader_cap_defaults_to_1_50():
     """Run 6: the weakening reader on a unit that edits one protected test file cost $0.65 twice
-    against 0.50 and burned both attempts."""
-    assert Caps().reader_call_usd == 1.5 == load_caps(Root(DEFAULT_BRAIN)).reader_call_usd
+    against 0.50 and burned both attempts. The shipped config doubled it to 3.00 with every other dollar cap on
+    2026-10-20 (`test_reader_budget`); the default is the battery's fixture number."""
+    assert Caps().reader_call_usd == 1.5 and load_caps(Root(DEFAULT_BRAIN)).reader_call_usd == 3.0
 
 
 def test_legacy_director_limits_are_preserved(root: Root):

@@ -8,11 +8,14 @@ from __future__ import annotations
 import copy
 import json
 import os
+import re
 import threading
 from dataclasses import KW_ONLY, InitVar, asdict, dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
+
+from protean.graph import graph
 
 
 @dataclass
@@ -97,8 +100,11 @@ class Call:
     when a resume finds it still pending. `attempt` is the unit's attempt for the worker and the try within
     one plan (1 or 2) for the director. `charge_usd` is what the task is charged; `receipt_cost_usd` is
     what the receipt reported, None without one. `actual_usd` is the receipt's figure, or "UNKNOWN" when no
-    receipt can say. `booked` turns true once `task.cost_usd` includes the charge. A measurement the
-    receipt does not carry is None, never 0."""
+    receipt can say; the worker and the reader are fresh sessions per call; the thinker resumes its session within a warm
+    stretch, whose receipt reports the whole session, so its figure is taken less the session's earlier receipt
+    (`budget.session_before`); `tokens` the same way. `booked` turns true once `task.cost_usd` includes the charge. A measurement the
+    receipt does not carry is None, never 0. `walk` is the id of the walk (`Fired.walk`) the call was opened in; None on
+    a record from before the field and on a call opened outside a walk."""
 
     id: str
     seat: str
@@ -115,6 +121,8 @@ class Call:
     tokens: dict[str, int | None] = field(default_factory=_no_tokens)
     session_id: str | None = None
     booked: bool = False
+    started: str | None = None  # when the pending record was opened (UTC, ISO seconds); None on an older record
+    walk: str | None = None
 
 
 DIRECTOR, RUNTIME = "director", "runtime"
@@ -144,11 +152,13 @@ class Question:
 class Thought:
     """One of the operator's contributions to the session (a console `think`; a `steer` on a goal-mode record),
     carried whole and in order in every later message to the seat: direction, an answer, a possibility or a decision,
-    as the seat reads it."""
+    as the seat reads it. `request_id` is the client's id for the `think` that landed it (`Request`); None when the
+    client sent none. The seat is sent the text only."""
 
     text: str
     created: str = ""
     actor: str = "console"
+    request_id: str | None = None
 
 
 Direction = Thought  # goal mode's name, kept for the tests that still build them by it
@@ -193,8 +203,11 @@ class Move:
     line; `cost_usd` is what it spent; `outcome` what became of it. Its pointers are set where the kind carries one:
     `branch` (an explore's `explore/<session>/<n>`, a task's `task/<session>`), `units` (a task's unit ids), `question`
     (an ask's question id), `ideas` (an ideas move's items), `brief` (an explore's brief, whole, as the thinker gave it)
-    and `report` (an explore's worker report, unverified by construction: nothing grades an explore). A record from
-    before `brief` loads with none."""
+    and `report` (an explore's worker report, unverified by construction: nothing grades an explore), and `paths` (a
+    landed explore's own changed paths, read in the workspace when it lands). `fire` names the registry nodes the move
+    fires (`graph.FIRES`: a task or an explore the worker, an ask or ideas the console, a rest the rest), as decoded. A
+    record from before `brief` or `paths` loads with none, and one from before `fire` with the firing its kind
+    derives."""
 
     id: str
     kind: str
@@ -207,6 +220,47 @@ class Move:
     ideas: list[Idea] = field(default_factory=list)
     report: str | None = None
     brief: str = ""
+    paths: list[str] = field(default_factory=list)
+    fire: list[str] = field(default_factory=list)
+
+
+@dataclass
+class Firing:
+    """One firing a tick ran: a thinker-fired node (`worker`, `console` or `rest`) with the move it came from and, for a
+    task unit, the unit. An explore is a worker firing with no unit."""
+
+    node: str
+    move: str | None = None
+    unit: str | None = None
+
+
+@dataclass
+class Fired:
+    """One tick's firing set: `tick` as the tick's `Call` records carry it (the ticks counted before it), the firings
+    it drew (a worker's from the queue; a console or rest firing from its own thinker call) and `walked`, the registry
+    nodes it ran, in order, up to where it ended (`block` twice when it reaches the end). The loop rewrites it at each
+    tick's start and every save in the tick persists it, so `task.json` keeps only the latest; the log keeps one
+    `fired` event per tick."""
+
+    tick: int = 0
+    fire: list[Firing] = field(default_factory=list)
+    walked: list[str] = field(default_factory=list)
+    # The walk's own id (`loop.run_tick`), unique within the session; `tick` stays the ticks counted before it, so a walk
+    # cut before its save and the walk that runs that tick again share `tick` and differ here. None on an older record.
+    walk: str | None = None
+
+
+@dataclass
+class Request:
+    """One accepted operation a client named with a `request_id` (`think` or `answer`), kept in `task.json` by the same
+    save that landed it: the id, the operation, its payload as received (think `text` and `decide`; answer `id` and
+    `text`) and the event it was answered with. The same id with the same operation and payload is answered with
+    `event` again and changes nothing; with any other, it is refused. A refused or failed operation is never kept."""
+
+    request_id: str
+    op: str
+    payload: dict[str, Any]
+    event: dict[str, Any]
 
 
 AUTO, HOLD = "auto", "hold"
@@ -247,7 +301,9 @@ class Task:
     `standing` (at most five plain sentences) and `open` are what the thinker's last accepted move said; `decided`
     is the operator's only and `moves` the brain's only. `awaiting_thought` is true after an `ideas` or a `rest` until a thought
     lands. `active_seconds` is the wall time the loop has spent driving ticks, each tick's added at its save; it accrues
-    the dollar allowance. `thought.md` beside `task.json` renders the thought record on every
+    the dollar allowance. `fired` is the latest tick's firing set (`Fired`), None before the first tick and on a record
+    from before the field. `requests` is the ledger of operations a client named with a `request_id` (`Request`), oldest
+    first; a record from before it loads with none. `thought.md` beside `task.json` renders the thought record on every
     save (`render_thought`).
 
     `goal` and `directions` are goal mode's names for `thought` and `thoughts`: the constructor takes them, they read
@@ -264,6 +320,7 @@ class Task:
     terminal: str | None = None
     stop_reason: str = ""
     director_session: str | None = None
+    director_called_at: str | None = None  # when the last thinker call returned (UTC, seconds): the stretch clock
     created: str = ""
     extra_usd: float = 0.0
     extra_ticks: int = 0
@@ -280,6 +337,8 @@ class Task:
     moves: list[Move] = field(default_factory=list)
     awaiting_thought: bool = False
     active_seconds: float = 0.0
+    fired: Fired | None = None
+    requests: list[Request] = field(default_factory=list)
     _: KW_ONLY
     goal: InitVar[str | None] = None
     directions: InitVar[list[Thought] | None] = None
@@ -299,6 +358,12 @@ def _alias(name: str) -> property:
 # After the class, so the generated constructor keeps its None defaults for the two names.
 Task.goal = _alias("thought")  # type: ignore[assignment]
 Task.directions = _alias("thoughts")  # type: ignore[assignment]
+
+
+def is_closed(task: Task) -> bool:
+    """The record admits no operation and no resume: the operator closed the session (`close`, 2026-10-20), abandoned it
+    (`resume --abandon`), or it is a goal-mode record that ended `done` (runs 1–6)."""
+    return task.terminal == "done" or task.stop_reason in ("abandoned", "closed")
 
 
 def open_questions(task: Task) -> list[Question]:
@@ -325,8 +390,8 @@ def to_json(task: Task) -> str:
 
 def from_json(text: str) -> Task:
     """Rebuild a task, its units, their predicates, call records, questions, thoughts and the thought record from
-    `to_json` output. A record saved before a field existed loads with that field's default; the file is never
-    versioned. Goal mode's `goal` and `directions` load as `thought` and `thoughts`. The pre-console `question` text
+    `to_json` output. A record saved before a field existed loads with that field's default (a move's `fire`: the
+    firing its kind derives); the file is never versioned. Goal mode's `goal` and `directions` load as `thought` and `thoughts`. The pre-console `question` text
     is dropped (questions live in `questions` now), and so are the two money fields a record of 2026-10-17 carries
     (the allowance replaced them)."""
     data = json.loads(text)
@@ -345,11 +410,15 @@ def from_json(text: str) -> Task:
     thoughts = [Thought(**t) for t in data.pop("thoughts", [])]
     open_items = [OpenItem(**o) for o in data.pop("open", [])]
     decided = [Decision(**d) for d in data.pop("decided", [])]
-    moves = [Move(**{**m, "ideas": [Idea(**i) for i in m.get("ideas", [])]}) for m in data.pop("moves", [])]
+    moves = [Move(**{**m, "ideas": [Idea(**i) for i in m.get("ideas", [])],
+                     "fire": m["fire"] if "fire" in m else graph.fires(m["kind"])}) for m in data.pop("moves", [])]
     held = data.pop("held", None)
     held = None if held is None else Held(**{**held, "units": [_unit(u) for u in held.get("units", [])]})
+    fired = data.pop("fired", None)
+    fired = None if fired is None else Fired(**{**fired, "fire": [Firing(**f) for f in fired.get("fire", [])]})
+    requests = [Request(**r) for r in data.pop("requests", [])]
     return Task(**data, units=units, calls=calls, questions=questions, thoughts=thoughts, open=open_items,
-                decided=decided, moves=moves, held=held)
+                decided=decided, moves=moves, held=held, fired=fired, requests=requests)
 
 
 def _unit(data: dict[str, Any]) -> Unit:
@@ -396,16 +465,35 @@ class Root:
 
     def thought_file(self, task_id: str) -> Path:
         """`thought.md`: the thought record as the operator reads it, rendered from `task.json` on every save; a view, never read
-        back."""
+        back (it can be ahead of `task.json` after a save that failed at its commit: `save`)."""
         return self.state_dir(task_id) / "thought.md"
 
     def console_file(self, task_id: str) -> Path:
         """Port, token and pid of the live brain's console; mode 0600, gone when no brain serves the task."""
         return self.state_dir(task_id) / "console.json"
 
+    def memory_file(self, project: str) -> Path:
+        """The brain's long-term memory of one project (`graph/memory.py`), one JSON line per remembered event. The
+        name keeps `[A-Za-z0-9._-]` and turns every other character into `_`, and a name of dots alone is `_`, so a
+        project never names a path outside `memory/`; the directory is created on write."""
+        safe = re.sub(r"[^A-Za-z0-9._-]", "_", project)
+        if not safe.strip("."):
+            safe = "_"
+        return self.path / "memory" / f"{safe}.jsonl"
+
     @property
     def current_file(self) -> Path:
         return self.path / "state" / "current"
+
+    @property
+    def lobby_file(self) -> Path:
+        """Host, port, token and pid of the lobby (`graph/lobby.py`); mode 0600, gone when no lobby serves."""
+        return self.path / "state" / "lobby.json"
+
+    @property
+    def lobby_log_dir(self) -> Path:
+        """Where the lobby writes each spawned brain's stdout and stderr, one `launch-<UTC>.log` per spawn."""
+        return self.path / "state" / "lobby"
 
     @property
     def config_file(self) -> Path:
@@ -472,10 +560,13 @@ def render_thought(task: Task) -> str:
 
 
 def save(root: Root, task: Task) -> None:
-    """Write `task.json`, replacing the previous copy in one rename, then its view `thought.md` beside it."""
+    """Write the view `thought.md`, then `task.json`, replacing the previous copy in one rename: that rename is the
+    commit point, so a save that raises has committed nothing (a failed view write never leaves the record saved).
+    When the view was written and `task.json` was not, `thought.md` is ahead of the record until the next save; it is
+    never read back, so nothing loads it as state."""
     with LOCK:
-        _write_atomic(root.task_file(task.id), to_json(task))
         _write_atomic(root.thought_file(task.id), render_thought(task))
+        _write_atomic(root.task_file(task.id), to_json(task))
 
 
 def load(root: Root, task_id: str) -> Task:

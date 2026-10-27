@@ -157,8 +157,9 @@ def _events(root: Root, task_id: str, kind: str) -> list[dict]:
 
 
 def _rested(line: dict) -> bool:
-    """The last line the loop logs for a `rest` move, before it waits for a thought: the record's change."""
-    return line.get("event") == "thought" and line.get("kind") == "rest"
+    """The last line the loop logs for a `rest` move, before it waits for a thought: its tick's `fired` event, which
+    ends every tick (shape SPEC decision 8), after the record's change (`thought`)."""
+    return line.get("event") == "fired" and "rest" in line.get("walked", [])
 
 
 def _parked_on_a_thought(root: Root, task: Task) -> bool:
@@ -340,6 +341,43 @@ def test_a_ceiling_stop_waits_for_extend_while_a_client_is_attached(env: tuple[R
     assert released["reason"] == "max_usd: 0.60 >= 0.5"
 
 
+def test_close_ends_the_live_session_for_good_books_the_call_in_flight_and_exits_11(
+    env: tuple[Root, Path], monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+):
+    """2026-10-20: `close` records the end first (stopped/closed, saved), then takes stop's path out; the record admits
+    nothing after and `resume` refuses it."""
+    root, workspace = env
+    in_call = threading.Event()
+
+    def runner(argv, stdin, cwd, timeout):
+        in_call.set()
+        time.sleep(10)  # the close's SIGINT cuts this short
+        raise AssertionError("close did not interrupt the call")
+
+    monkeypatch.setattr(cli, "real_runner", runner)
+
+    def script(seen: dict) -> None:
+        assert in_call.wait(10)
+        seen["close"] = _client(root).call("POST", "/close")
+
+    thread, seen = _in_client_thread(script)
+    code = cli.main(["--brain", str(root.path), "think", "g", "--workspace", str(workspace)])
+    thread.join(10)
+    assert "error" not in seen, repr(seen.get("error"))
+    assert (code, seen["close"][0]) == (11, 200) and "session closed" in capsys.readouterr().err
+    task = state.current(root)
+    assert (task.cost_usd, task.terminal, task.stop_reason, task.tick) == (2.0, "stopped", "closed", 0)
+    (call,) = task.calls
+    assert (call.seat, call.outcome, call.charge_usd, call.booked) == ("director", "interrupted", 2.0, True)
+    order = [e["event"] for e in director.read_log(root, task.id)]
+    assert order.index("close") < order.index("interrupted")
+    assert seen["close"][1]["event"] == {"event": "close", "actor": "console", "live": True, "superseded": [],
+                                        "held": None} and not root.console_file(task.id).exists()
+    assert not root.clones_dir(task.id).exists()
+    code = cli.main(["--brain", str(root.path), "resume"])
+    assert code == 11 and len(state.current(root).calls) == 1  # refused: nothing ran
+
+
 def test_stop_takes_the_ctrl_c_path_books_the_call_in_flight_and_exits_130(
     env: tuple[Root, Path], monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ):
@@ -363,7 +401,7 @@ def test_stop_takes_the_ctrl_c_path_books_the_call_in_flight_and_exits_130(
     assert "error" not in seen, repr(seen.get("error"))
     assert (code, seen["stop"][0]) == (130, 200) and "booked" in capsys.readouterr().err
     task = state.current(root)
-    assert (task.cost_usd, task.terminal, task.tick) == (2.0, None, 0)
+    assert (task.cost_usd, task.terminal, task.tick) == (2.0, "interrupted", 0)  # a stop parks the record (decision 26)
     (call,) = task.calls
     assert (call.seat, call.outcome, call.charge_usd, call.booked) == ("director", "interrupted", 2.0, True)
     order = [e["event"] for e in director.read_log(root, task.id)]
@@ -464,7 +502,7 @@ def test_extend_is_the_only_operation_that_changes_a_ceiling_and_never_a_per_cal
     start = in_force()
     assert start == {"max_usd": 25.0, "max_ticks": 100, "extra_usd": 0.0, "extra_ticks": 0, "accrued_usd": 0.0,
                      "allowance_usd": 25.0, "active_seconds": 0.0, "director_call_usd": 2.0, "worker_call_usd": 4.0,
-                     "reader_call_usd": 1.5}
+                     "reader_call_usd": 1.5, "reader_max_usd": 7.0, "reader_usd": 0.0, "counted_usd": 0.0}
     for path, body in [("/pause", {}), ("/resume", {}), ("/think", {"text": "use tabs", "decide": True}),
                        ("/answer", {"id": "q1", "text": "a.txt"}), ("/answer", {"id": "q2", "text": "yes"}),
                        ("/stop", {})]:
@@ -489,7 +527,7 @@ def test_extend_is_the_only_operation_that_changes_a_ceiling_and_never_a_per_cal
     assert asdict(desk.caps) == caps_before
     saved = load(root, task.id)
     assert (saved.extra_usd, saved.extra_ticks) == (1_000_003.75, 6)
-    argv = director.argv(saved, desk.caps, root, None)
+    argv = director.argv(saved, desk.caps, root)
     assert argv[argv.index("--max-budget-usd") + 1] == "2.00"  # the next director call keeps its per-call cap
 
 
@@ -636,10 +674,78 @@ def test_the_stream_ends_with_a_snapshot_of_the_state_the_run_ended_in(env: tupl
     first, *middle, last = seen["lines"]
     assert set(first) == {"snapshot"} and first["snapshot"]["terminal"] is None and seen["stop"][0] == 200
     assert all("event" in line for line in middle) and "director" in [line["event"] for line in middle]
-    assert [line["event"] for line in middle][-1] == "stop" and _events(root, task.id, "parked") == []
-    assert set(last) == {"snapshot"} and (last["snapshot"]["terminal"], task.awaiting_thought) == (None, True)
+    # A stop parks the record (decision 26, 2026-10-23): the `parked` event follows the `stop`, and the last snapshot
+    # carries `interrupted`, so a client that takes state only from snapshots reads Parked, never a lost brain.
+    assert [line["event"] for line in middle][-2:] == ["stop", "parked"]
+    assert [(e["hold"], e["on"]) for e in _events(root, task.id, "parked")] == [("stop", "the operator")]
+    assert set(last) == {"snapshot"} and (last["snapshot"]["terminal"], task.awaiting_thought) == ("interrupted", True)
     assert (last["snapshot"]["tick"], last["snapshot"]["cost_usd"]) == (task.tick, task.cost_usd)
     assert last["snapshot"]["log_bytes"] == root.log_file(task.id).stat().st_size  # nothing after it is missing
+
+
+def _stop_during_the_clone_with_a_client_attached(root: Root, workspace: Path,
+                                                  monkeypatch: pytest.MonkeyPatch) -> tuple[dict, Task]:
+    """Run a session whose first unit's clone is cut by a stop while a client holds the stream, as a window would:
+    what the client saw (`lines`) and the record on disk after the run."""
+    runner = ScriptedRunner([_reply({"task": [UNIT]})], [])
+    attached = threading.Event()
+
+    def stop_during_the_clone(*args: object, **kwargs: object) -> None:
+        attached.wait(10)  # the client holds the stream before the stop lands, as a window would
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(worker, "fresh_clone", stop_during_the_clone)
+
+    def script(seen: dict) -> None:
+        client = _client(root)
+        stream = Stream(client)
+        stream.start()
+        stream.wait_for(lambda line: "snapshot" in line)
+        attached.set()
+        stream.join(15)
+        seen["lines"] = list(stream.lines)
+        stream.close()
+
+    thread, seen = _in_client_thread(script)
+    with pytest.raises(KeyboardInterrupt):
+        loop.run("g", workspace, root, Caps(), runner, unattended=0.2)
+    thread.join(15)
+    assert "error" not in seen, repr(seen.get("error"))
+    return seen, state.current(root)
+
+
+def test_a_stop_during_a_clone_streams_the_record_on_disk_as_its_last_snapshot(env: tuple[Root, Path],
+                                                                            monkeypatch: pytest.MonkeyPatch):
+    """Audit 2026-10-23, H3 (F1's stream half): the mark writes the record on disk, but the stream's last snapshot was
+    still built from the loop's in-memory task — the attached window's final page read "Attempts 1" for a unit that
+    never ran while `task.json` and `/session` said 0. The console now serves the record the mark wrote."""
+    root, workspace = env
+    seen, task = _stop_during_the_clone_with_a_client_attached(root, workspace, monkeypatch)
+    *_, last = seen["lines"]
+    assert set(last) == {"snapshot"} and last["snapshot"]["terminal"] == "interrupted"
+    assert [u["attempts"] for u in last["snapshot"]["units"]] == [u.attempts for u in task.units] == [0]
+
+
+def test_a_second_interrupt_mid_mark_still_streams_the_record_on_disk(env: tuple[Root, Path],
+                                                                     monkeypatch: pytest.MonkeyPatch):
+    """Audit 2026-10-23, I3: the console took the on-disk record only once the mark had landed, so a second
+    KeyboardInterrupt mid-mark (a double Ctrl-C, SIGTERM then SIGHUP) left it serving the dirty task — "Attempts 1",
+    terminal None, a lost brain — while `task.json` said interrupted at 0. The console takes the record the moment it
+    is read, before the mark; the `parked` event the second signal cuts is the one thing missing."""
+    root, workspace = env
+    real = state.append_log
+
+    def second_interrupt(root_: Root, task_id: str, event: dict) -> None:
+        if event.get("event") == "parked":
+            raise KeyboardInterrupt  # the second signal lands after the save, before the parked event
+        real(root_, task_id, event)
+
+    monkeypatch.setattr(state, "append_log", second_interrupt)
+    seen, task = _stop_during_the_clone_with_a_client_attached(root, workspace, monkeypatch)
+    assert (task.terminal, [u.attempts for u in task.units], _events(root, task.id, "parked")) == ("interrupted", [0], [])
+    *_, last = seen["lines"]
+    assert set(last) == {"snapshot"} and last["snapshot"]["terminal"] == "interrupted"
+    assert [u["attempts"] for u in last["snapshot"]["units"]] == [0]
 
 
 # --- stop must end the run however the brain was launched (found by the app session, 2026-10-11) ---
@@ -668,8 +774,9 @@ def test_stop_during_a_wait_ends_the_run_even_when_sigint_is_ignored(env: tuple[
     assert "error" not in seen, repr(seen.get("error"))
     assert seen["stop"][0] == 200
     task = state.current(root)
-    assert task.terminal is None and [q.status for q in task.questions] == ["open"]  # resume continues it
-    assert [e["event"] for e in director.read_log(root, task.id)][-1] == "stop"
+    # A stop parks the record (`interrupted`, decision 26 of 2026-10-23) with the question open: resume continues it.
+    assert task.terminal == "interrupted" and [q.status for q in task.questions] == ["open"]
+    assert [e["event"] for e in director.read_log(root, task.id)][-2:] == ["stop", "parked"]
     assert not root.console_file(task.id).exists()
 
 

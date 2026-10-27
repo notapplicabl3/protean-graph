@@ -31,7 +31,7 @@ from typing import Any
 
 from protean.graph import budget, grade, worker
 from protean.graph.budget import Caps
-from protean.runner import Charge, Runner, RunResult, charged_cap, floor_reason, no_charge, usd_cap
+from protean.runner import NO_MCP, Charge, Runner, RunResult, charged_cap, floor_reason, no_charge, usd_cap
 from protean.state import Call, Root, Task, Unit, save
 
 TOOLS = ("Read", "Grep", "Glob")
@@ -85,8 +85,8 @@ def argv(task: Task, caps: Caps, root: Root, clone: Path, sandbox: str, spent: f
     `--tools` (as the director's), the reader cap clipped to what the task has left after `spent`, the prompt."""
     return [
         sandbox, "-p", sandbox_profile(clone, Path(task.workspace), root.console_file(task.id)),
-        "claude", "-p", "--setting-sources", "", "--output-format", "json",
-        "--max-budget-usd", usd_cap(caps.reader_call_usd, task, caps, spent),
+        "claude", "-p", "--setting-sources", "", *NO_MCP, "--output-format", "json",
+        "--max-budget-usd", usd_cap(caps.reader_call_usd, task, caps, spent, reader=True),
         "--model", caps.reader_model, "--permission-mode", "dontAsk", "--tools", *TOOLS, "--allowedTools", *TOOLS,
         "--system-prompt", root.reader_prompt.read_text(encoding="utf-8"),
     ]
@@ -161,7 +161,7 @@ def check(task: Task, unit: Unit, brief: dict[str, Any], caps: Caps, root: Root,
     binary, or when the clone cannot be prepared. The record is saved with the task before launch and resolved from
     the receipt; a call that leaves none is charged its cap. A call interrupted before it returns is resolved
     `interrupted` and its cap goes through `charge` before the interruption propagates. Booking is the caller's."""
-    floor = floor_reason(task, caps, spent)
+    floor = floor_reason(task, caps, spent, reader=True)
     if floor:
         return Check(None, f"no reader call: {floor}", "floor")
     try:

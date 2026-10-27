@@ -10,6 +10,7 @@ from __future__ import annotations
 import json
 import math
 from dataclasses import dataclass, field, fields, replace
+from datetime import datetime, timezone
 
 from protean.state import Call, Root, Task
 
@@ -35,6 +36,8 @@ class Caps:
     on run 6's receipts: with the 1-hour cache write at $10, input·5 + output·25 + cache_read·0.5 + cache_creation·10
     gives calls c2 ($2.795631) and c3 ($1.82465) to the cent."""
 
+    # These defaults are the battery's fixture numbers. The operator's live numbers are `brain/protean/config.json`,
+    # where every dollar cap was doubled 2026-10-20 (the operator's ruling during session 7; the tick ceiling stayed).
     max_usd: float = 25.0
     max_ticks: int = 100
     accrual_usd: float = 10.0
@@ -48,6 +51,9 @@ class Caps:
     # The reader seat's per-call cap, charged to the task; 0.5 until run 6, where the weakening reader
     # on a unit that edits one protected test file cost $0.65 twice against 0.50 and burned both attempts.
     reader_call_usd: float = 1.5
+    # The reader's own session budget (2026-10-20): reader spend is booked like every call's but never counts toward
+    # the allowance; together the reader's calls may spend this much, and under the call floor of it none starts.
+    reader_max_usd: float = 7.0
     reader_wall_seconds: int = 300
     director_model: str = "claude-opus-5"  # each seat's `--model`
     worker_model: str = "claude-opus-5"
@@ -121,6 +127,16 @@ def allowance(task: Task, caps: Caps) -> float:
     return caps.max_usd + task.extra_usd + accrued_usd(task, caps)
 
 
+def reader_usd(task: Task) -> float:
+    """What the reader's booked calls have spent: charged to the session's ledger, never to its allowance."""
+    return sum((call.charge_usd or 0.0 for call in task.calls if call.seat == "reader" and call.booked), 0.0)
+
+
+def counted_usd(task: Task) -> float:
+    """The booked spend the allowance counts: everything but the reader's."""
+    return task.cost_usd - reader_usd(task)
+
+
 def call_caps(task: Task, caps: Caps) -> Caps:
     """`caps` as a call is clipped by: `max_usd` raised by what has accrued, so what the runner counts as left
     (`runner.usd_left`: `max_usd` plus the task's extensions, less its cost and any `spent`) is what the allowance has
@@ -130,12 +146,18 @@ def call_caps(task: Task, caps: Caps) -> Caps:
     return replace(caps, max_usd=caps.max_usd + accrued_usd(task, caps))
 
 
+def wider(caps: Caps) -> Caps:
+    """`caps` with the reader's per-call cap doubled: the cap a reader call that reached its own is asked again under
+    (`gate.ask`), still clipped by what the allowance has left as every call is (`call_caps`, `runner.usd_cap`)."""
+    return replace(caps, reader_call_usd=2 * caps.reader_call_usd)
+
+
 def allowance_reason(task: Task, caps: Caps) -> str | None:
-    """The allowance the session's spend has reached, named with its numbers, or None while it is under it (a sum of
-    receipts may land a hair under the allowance it reached)."""
-    allowed = allowance(task, caps)
-    if task.cost_usd >= allowed - 1e-9:
-        return f"max_usd: {task.cost_usd:.2f} >= {round(allowed, 2)}"
+    """The allowance the session's counted spend (`counted_usd`: the reader's excluded) has reached, named with its
+    numbers, or None while it is under it (a sum of receipts may land a hair under the allowance it reached)."""
+    allowed, counted = allowance(task, caps), counted_usd(task)
+    if counted >= allowed - 1e-9:
+        return f"max_usd: {counted:.2f} >= {round(allowed, 2)}"
     return None
 
 
@@ -205,18 +227,48 @@ def tokens_of(receipt: dict) -> dict[str, int | None]:
 
 
 def open_call(task: Task, seat: str, attempt: int, cap: float, message: str | None, unit: str | None = None) -> Call:
-    """Add a pending record for a call about to start, with its reserved cap; the caller saves the task
-    before the process launches."""
+    """Add a pending record for a call about to start, with its reserved cap, when it was opened (`started`, the
+    snapshot's `doing.since`) and the walk it runs in (`walk`, the tick's `Fired.walk`; None outside one); the caller
+    saves the task before the process launches."""
     call = Call(id=f"c{len(task.calls) + 1}", seat=seat, attempt=attempt, cap_usd=cap, unit=unit, tick=task.tick,
-                message_bytes=None if message is None else len(message.encode("utf-8")))
+                message_bytes=None if message is None else len(message.encode("utf-8")),
+                started=datetime.now(timezone.utc).isoformat(timespec="seconds"),
+                walk=task.fired.walk if task.fired is not None else None)
     task.calls.append(call)
     return call
 
 
+def session_before(task: Task, receipt: dict, call: Call) -> tuple[float, dict[str, int]]:
+    """What the receipt's session had already spent before `call`: a resumed `claude -p --resume` reports
+    `total_cost_usd` and `usage` for the WHOLE session (session 7: $8.64 then $8.88 for a $0.24 call, booked as
+    $17.52), so a call's own spend is the receipt's figure less the latest earlier receipt of the same session, and
+    its tokens are the receipt's less what the session's earlier records already hold. A fresh session (the worker,
+    the reader, a thinker call after a cold stretch) has nothing before it."""
+    session = receipt.get("session_id")
+    spent, tokens = 0.0, {name: 0 for name, _, _ in TOKEN_FIELDS}
+    if not isinstance(session, str):
+        return spent, tokens
+    for earlier in task.calls:
+        if earlier is call or earlier.session_id != session or earlier.receipt_cost_usd is None:
+            continue
+        spent = earlier.receipt_cost_usd
+        for name in tokens:
+            tokens[name] += earlier.tokens.get(name) or 0
+    return spent, tokens
+
+
+def call_cost(task: Task, receipt: dict, call: Call) -> tuple[float, tuple[float, dict[str, int]]]:
+    """Dollars one call of a possibly resumed session spent (`cost_of` less `session_before`, never below 0), with
+    the baseline to hand `resolve`."""
+    before = session_before(task, receipt, call)
+    return round(max(0.0, cost_of(receipt) - before[0]), 7), before
+
+
 def resolve(call: Call, charge: float, receipt: dict | None = None, *, timed_out: bool = False,
-            interrupted: bool = False) -> None:
+            interrupted: bool = False, before: tuple[float, dict[str, int]] | None = None) -> None:
     """Fill a record from how its call ended: the charge the seat books and the receipt, None when the call
-    left no usable one. What the receipt does not carry stays None."""
+    left no usable one. What the receipt does not carry stays None. `before` (`session_before`) makes a resumed
+    session's cumulative receipt this call's own: `actual_usd` and `tokens` are the receipt's figures less it."""
     if interrupted:
         call.outcome = "interrupted"
     elif timed_out:
@@ -231,7 +283,11 @@ def resolve(call: Call, charge: float, receipt: dict | None = None, *, timed_out
         call.subtype = receipt.get("subtype") if isinstance(receipt.get("subtype"), str) else None
         call.tokens = tokens_of(receipt)
         call.session_id = receipt.get("session_id") if isinstance(receipt.get("session_id"), str) else None
-    call.actual_usd = UNKNOWN if call.receipt_cost_usd is None else call.receipt_cost_usd
+        if before is not None:
+            call.tokens = {name: None if count is None else max(0, count - before[1].get(name, 0))
+                           for name, count in call.tokens.items()}
+    spent = 0.0 if before is None else before[0]
+    call.actual_usd = UNKNOWN if call.receipt_cost_usd is None else round(max(0.0, call.receipt_cost_usd - spent), 7)
 
 
 def book(task: Task, call: Call) -> None:

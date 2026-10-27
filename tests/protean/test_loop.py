@@ -7,16 +7,18 @@ import itertools
 import json
 import os
 import subprocess
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
 
 from protean import loop, state
-from protean.graph import grade, director
+from protean.graph import grade, graph, director, worker
 from protean.graph.budget import Caps
 from protean.dry import FIXTURES, ScriptedRunner, make_workspace, read_jsonl
 from protean.runner import RunResult
-from protean.state import Predicate, Question, Root, Task, Unit, load, open_questions, save, set_current
+from protean.state import (Fired, Firing, Predicate, Question, Root, Task, Unit, load, open_questions, save,
+                           set_current)
 
 UNIT = {"id": "u-1", "intent": "write a.txt", "predicates": [
     {"kind": "file_exists", "args": {"path": "a.txt"}}, {"kind": "exit_code", "args": {"code": 0}}]}
@@ -353,39 +355,63 @@ def test_exit_code_0_permits_grading_and_never_substitutes_for_it(env: tuple[Roo
     assert first["notes"]["p1"] == "file_exists: missing: a.txt"
 
 
-TICK_ORDER = ["repair", "block", "ceiling", "release", "pick", "retry", "seat", "block", "save"]
+# The tick order is the registry's (`graph.NODES`), walked by `loop._walk`. These three re-pin, against the registry's
+# edges and its node acts, the tests that pinned the retired `loop.TICK` sequence (shape SPEC decision 9; its ceiling
+# step is the budget node, its retry step the hold node, its seat the thinker or the worker).
+THINKER_TICK = ["repair", "block", "budget", "release", "pick", "hold", "director", "block", "save"]
 
 
-def test_the_tick_order_is_declared_once_as_named_steps_in_the_record_s_order():
-    assert [step.name for step in loop.TICK] == TICK_ORDER
+def _walk(*adds: str) -> list[str]:
+    """The node names of the walk the registry's edges give the entries in every tick plus `adds`."""
+    return [graph.entries()[key].name for key in graph.order(graph.always() + list(adds))]
 
 
-def test_run_tick_runs_the_declared_steps_in_order_until_one_ends_the_tick(
+def _traced(monkeypatch: pytest.MonkeyPatch) -> list[str]:
+    """Every node act the walker calls, in order, as it calls it."""
+    visited: list[str] = []
+    acts = {name: (lambda tick, name=name, act=act: visited.append(name) or act(tick)) for name, act in loop.ACTS.items()}
+    monkeypatch.setattr(loop, "ACTS", acts)
+    return visited
+
+
+def test_the_registry_s_edges_give_the_record_s_tick_order_and_every_walked_node_has_one_act():
+    assert _walk("director") == THINKER_TICK
+    assert _walk("worker", "grader", "gate", "ref") == THINKER_TICK[:6] + ["worker", "grader", "gate", "ref", "block",
+                                                                         "save"]
+    assert set(loop.ACTS) == {node.name for node in graph.NODES} - {"reader"}  # the reader runs inside other nodes
+    assert not hasattr(loop, "TICK")
+
+
+def test_run_tick_walks_the_registry_s_order_until_a_node_ends_the_tick(
     env: tuple[Root, Path], monkeypatch: pytest.MonkeyPatch
 ):
     root, workspace = env
-    visited: list[str] = []
-    traced = tuple(loop.Step(s.name, lambda tick, s=s: visited.append(s.name) or s.act(tick)) for s in loop.TICK)
-    monkeypatch.setattr(loop, "TICK", traced)
+    visited = _traced(monkeypatch)
     task, runner = _task(root, workspace), ScriptedRunner([_reply({"task": [UNIT]})], [])
     loop.run_tick(task, Caps(), root, runner)
-    assert (visited, task.tick, len(runner.calls)) == (TICK_ORDER, 1, 1)
+    assert (visited, task.tick, len(runner.calls)) == (THINKER_TICK, 1, 1)
+    fired = [e for e in director.read_log(root, task.id) if e["event"] == "fired"]
+    assert [(e["tick"], e["fire"], e["walked"]) for e in fired] == [(0, [], THINKER_TICK)]  # the task move is queued
     visited.clear()
     loop.run_tick(task, Caps(max_ticks=1), root, runner)  # the ceiling ends it
-    assert (visited, task.terminal, len(runner.calls)) == (TICK_ORDER[:3], "stopped", 1)
+    assert (visited, task.terminal, len(runner.calls)) == (THINKER_TICK[:3], "stopped", 1)
+    assert task.fired == Fired(tick=1, walked=THINKER_TICK[:3], walk=task.fired.walk) == load(root, task.id).fired
     visited.clear()
-    loop.run_tick(task, Caps(), root, runner)  # a terminal task: the first step ends it
-    assert visited == TICK_ORDER[:1]
+    loop.run_tick(task, Caps(), root, runner)  # a terminal task: the first node ends it
+    assert visited == THINKER_TICK[:1]
     visited.clear()
     retry = Unit("u-1", "write a.txt", [Predicate("file_exists", {"path": "a.txt"})], "pending", 1)
     task = _task(root, workspace, mode="hold", units=[retry])
     loop.run_tick(task, Caps(), root, runner)  # in hold, the retry is held for approve
-    assert (visited, task.held.kind, task.tick, len(runner.calls)) == (TICK_ORDER[:6], "retry", 0, 1)
+    assert (visited, task.held.kind, task.tick, len(runner.calls)) == (THINKER_TICK[:6], "retry", 0, 1)
+    assert task.fired.fire == [Firing("worker", unit="u-1")]  # drawn, then held
 
 
-def test_changing_an_entry_of_the_tick_order_changes_what_runs(env: tuple[Root, Path], monkeypatch: pytest.MonkeyPatch):
+def test_changing_an_entry_or_one_declared_edge_of_the_registry_changes_what_runs(
+    env: tuple[Root, Path], monkeypatch: pytest.MonkeyPatch
+):
     root, workspace = env
-    declared, visits = loop.TICK, []
+    declared, acts, visits = graph.NODES, dict(loop.ACTS), []
 
     def at_the_tick_ceiling() -> tuple:
         task, runner = _task(root, workspace, tick=100), ScriptedRunner([_reply({"ask": "which file?"})], [])
@@ -394,13 +420,65 @@ def test_changing_an_entry_of_the_tick_order_changes_what_runs(env: tuple[Root, 
 
     stopped = ("stopped", "max_ticks: 100 >= 100", 100, 0)
     assert at_the_tick_ceiling() == stopped
-    recorder = loop.Step("ceiling", lambda tick: visits.append(tick.task.tick) or False)
-    monkeypatch.setattr(loop, "TICK", tuple(recorder if s.name == "ceiling" else s for s in declared))
-    assert at_the_tick_ceiling() == (None, "", 101, 1) and visits == [100]  # the director ran past the ceiling
-    stub = loop.Step("seat", lambda tick: setattr(tick, "line", "seat stubbed") or False)
-    monkeypatch.setattr(loop, "TICK", tuple(stub if s.name == "seat" else s for s in declared))
+    monkeypatch.setattr(loop, "ACTS", {**acts, "budget": lambda tick: visits.append(tick.task.tick) or False})
+    assert at_the_tick_ceiling() == (None, "", 101, 1) and visits == [100]  # the thinker ran past the ceiling
+    monkeypatch.setattr(loop, "ACTS", {**acts, "director": lambda tick: setattr(tick, "line", "thinker stubbed") or False})
     task, runner, lines = _task(root, workspace), ScriptedRunner([], []), []
     loop.run_tick(task, Caps(), root, runner, echo=lines.append)
-    assert (lines, runner.calls, task.tick) == (["tick 1: seat stubbed"], [], 1)
-    monkeypatch.setattr(loop, "TICK", declared)
+    assert (lines, runner.calls, task.tick) == (["tick 1: thinker stubbed"], [], 1)
+    monkeypatch.setattr(loop, "ACTS", acts)
     assert at_the_tick_ceiling() == stopped
+
+    def a_rest_on_a_project() -> tuple[list[str], int]:
+        task = _task(root, workspace, project="demo")
+        loop.run_tick(task, Caps(), root, ScriptedRunner([_reply({"rest": True})], []))
+        remembered = root.memory_file("demo")
+        return task.fired.walked, len(remembered.read_text().splitlines()) if remembered.exists() else 0
+
+    rest = THINKER_TICK[:7] + ["rest", "memory", "block", "save"]
+    assert a_rest_on_a_project() == (rest, 1)
+    unbrought = tuple(replace(node, brings=()) if node.name == "rest" else node for node in declared)
+    monkeypatch.setattr(graph, "NODES", unbrought)  # one edge: a rest no longer brings memory's line
+    assert a_rest_on_a_project() == ([n for n in rest if n != "memory"], 1)  # no line written
+    monkeypatch.setattr(graph, "NODES", declared)
+    assert a_rest_on_a_project() == (rest, 2)
+
+
+def test_a_stop_during_the_drive_parks_the_record_interrupted(env: tuple[Root, Path]):
+    """Audit 2026-10-23, D2: the console's `stop`, Ctrl-C, SIGTERM and SIGHUP all leave the drive with KeyboardInterrupt;
+    the record used to keep `terminal: null`, which a client reads as a brain that vanished. Now it is `interrupted`, as
+    an unattended park is, with a `parked` event, and `protean resume` clears it as it clears a park."""
+    root, workspace = env
+    task = _task(root, workspace, units=[Unit("u-1", "write a.txt", [Predicate("file_exists", {"path": "a.txt"})])])
+    with pytest.raises(KeyboardInterrupt):
+        loop.resume(root, Caps(), _interrupt)
+    saved = load(root, task.id)
+    assert (saved.terminal, saved.stop_reason or None, state.is_closed(saved)) == ("interrupted", None, False)
+    assert saved.cost_usd == 4.0  # the cut worker call (the unit is pending) was booked before the mark (`_charger`)
+    (parked,) = [e for e in director.read_log(root, task.id) if e["event"] == "parked"]
+    assert (parked["hold"], parked["on"]) == ("stop", "the operator")
+    interrupted = [e for e in director.read_log(root, task.id) if e["event"] == "interrupted"]
+    assert [e["seat"] for e in interrupted] == ["worker"]
+
+
+def test_a_stop_marks_the_record_on_disk_and_persists_nothing_the_tick_had_not_saved(env: tuple[Root, Path],
+                                                                                   monkeypatch: pytest.MonkeyPatch):
+    """Audit 2026-10-23, F1: the stop mark saved the loop's in-memory task, so a Stop during a unit's first clone
+    persisted `attempts: 1` with no call — on resume a unit that never ran was held as "retry of u-1 (attempt 2)" in
+    hold mode and burned as attempt 2, the maximum, in auto. The mark now writes `interrupted` on the record as the
+    tick last saved it: the unit still has no attempt and no call."""
+    root, workspace = env
+    task = _task(root, workspace, units=[Unit("u-1", "write a.txt", [Predicate("file_exists", {"path": "a.txt"})])])
+
+    def stop_during_the_clone(*args: object, **kwargs: object) -> None:
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(worker, "fresh_clone", stop_during_the_clone)
+    runner = ScriptedRunner([], [])
+    with pytest.raises(KeyboardInterrupt):
+        loop.resume(root, Caps(), runner)
+    saved = load(root, task.id)
+    assert (saved.terminal, saved.units[0].attempts, saved.calls, saved.cost_usd, runner.calls) == (
+        "interrupted", 0, [], 0.0, [])
+    (parked,) = [e for e in director.read_log(root, task.id) if e["event"] == "parked"]
+    assert (parked["hold"], parked["on"]) == ("stop", "the operator")

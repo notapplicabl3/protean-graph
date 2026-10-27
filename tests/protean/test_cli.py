@@ -130,7 +130,8 @@ def test_a_ctrl_c_mid_call_exits_130_with_the_charge_on_disk(root: Root, task: T
         monkeypatch.undo()
     assert "booked" in capsys.readouterr().err
     saved = load(root, task.id)
-    assert (saved.cost_usd, saved.units[0].attempts, saved.terminal) == (4.0, 1, None)
+    # A stop parks the record (`interrupted`, decision 26 of 2026-10-23); `resume` clears it as it clears a park.
+    assert (saved.cost_usd, saved.units[0].attempts, saved.terminal) == (4.0, 1, "interrupted")
 
 
 @pytest.mark.parametrize("text, parsed", [("5", (0.0, 5)), ("$2.5", (2.5, 0)), ("$3", (3.0, 0))])

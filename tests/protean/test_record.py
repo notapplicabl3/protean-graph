@@ -1,5 +1,6 @@
 """The record: the thought record's fields in `task.json`, the goal-mode names as load aliases, the
-six live records of runs 1–6 loading unchanged, and `thought.md` rendered from the record on every save."""
+six live records of runs 1–6 loading unchanged, all nine evidence records (sessions 7–9 too) loading with the shape's
+fields at their defaults, and `thought.md` rendered from the record on every save."""
 
 from __future__ import annotations
 
@@ -12,7 +13,7 @@ import pytest
 
 from protean import loop, state
 from protean.dry import FIXTURES, REPO, ScriptedRunner, make_workspace, read_jsonl
-from protean.graph import console
+from protean.graph import console, graph
 from protean.graph.budget import Caps
 from protean.state import (
     Decision, Direction, Idea, Move, OpenItem, Root, Task, Thought, from_json, load, render_thought, save, to_json,
@@ -104,7 +105,7 @@ def test_each_live_record_of_runs_1_to_6_loads_unchanged_with_the_new_fields_at_
     raw = json.loads(before)
     task = from_json(before.decode("utf-8"))
     assert task.thought == raw["goal"] and task.goal == raw["goal"]
-    assert [asdict(t) for t in task.thoughts] == raw.get("directions", [])
+    assert [asdict(t) for t in task.thoughts] == [{**d, "request_id": None} for d in raw.get("directions", [])]
     assert all(isinstance(t, Thought) for t in task.thoughts)
     assert (task.standing, task.open, task.decided, task.moves, task.awaiting_thought) == ("", [], [], [], False)
     assert task.active_seconds == 0.0
@@ -115,6 +116,32 @@ def test_each_live_record_of_runs_1_to_6_loads_unchanged_with_the_new_fields_at_
     assert "goal" not in snap and len(snap["units"]) == len(raw["units"])
     save(root, task)
     assert root.thought_file(task.id).read_text(encoding="utf-8") == render_thought(load(root, task.id)) == view
+    assert source.read_bytes() == before
+
+
+EVIDENCE = sorted((REPO / "evidence").glob("*/task.json"))  # runs 1–6 (`live-*`) and sessions 7–9 (`think-*`)
+
+
+def test_nine_evidence_records_are_found():
+    if not EVIDENCE:
+        pytest.skip("the receipts are not in this tree (withheld from the public mirror)")
+    assert [path.parent.name.rsplit("-", 3)[0] for path in EVIDENCE] == [
+        "live-1", "live-2", "live-3", "live-4", "live-5", "live-6", "think-1", "think-2", "think-3"]
+
+
+@pytest.mark.parametrize("source", EVIDENCE, ids=[path.parent.name for path in EVIDENCE])
+def test_each_evidence_record_loads_unchanged_with_the_shape_s_fields_at_their_defaults(source: Path):
+    """Shape SPEC row 5: a record from before the registry has no `fired` and no move carries `fire`; it loads with
+    `fired` None and each move's firing derived from its kind, and its snapshot renders with `fired` null. Read, never
+    written: its bytes are the same after."""
+    before = source.read_bytes()
+    raw = json.loads(before)
+    assert "fired" not in raw and all("fire" not in move for move in raw.get("moves", []))
+    task = from_json(before.decode("utf-8"))
+    assert task.fired is None
+    assert [m.fire for m in task.moves] == [list(graph.FIRES[m["kind"]]) for m in raw.get("moves", [])]
+    snap = json.loads(json.dumps(console.snapshot(task, Caps(), live=False)))
+    assert snap["fired"] is None and len(snap["moves"]) == len(raw.get("moves", []))
     assert source.read_bytes() == before
 
 
@@ -153,7 +180,8 @@ def test_a_move_s_text_never_breaks_its_one_line():
 def test_thought_md_equals_the_render_of_the_saved_record_after_every_save(tmp_path: Path, root: Root,
                                                                          monkeypatch: pytest.MonkeyPatch):
     """every save of a whole dry run (the `dry` scenario, through the loop) leaves `thought.md` equal to the
-    render of the `task.json` that save wrote, checked at each write."""
+    render of the `task.json` that save wrote, checked at each write. The view is written first and the record's
+    rename commits the save, so a failed view write never leaves the record saved."""
     root.path.mkdir(parents=True)
     root.thinker_prompt.write_text("m\n")
     root.editor_prompt.write_text("e\n")
@@ -163,9 +191,9 @@ def test_thought_md_equals_the_render_of_the_saved_record_after_every_save(tmp_p
     def write(path: Path, text: str) -> None:
         real_write(path, text)
         written.append(path.name)
-        if path.name == "thought.md":
-            record = from_json(path.with_name("task.json").read_text(encoding="utf-8"))
-            assert text == render_thought(record)
+        if path.name == "task.json":
+            record = from_json(text)
+            assert path.with_name("thought.md").read_text(encoding="utf-8") == render_thought(record)
             checked.append(record.tick)
 
     monkeypatch.setattr(state, "_write_atomic", write)
@@ -174,7 +202,7 @@ def test_thought_md_equals_the_render_of_the_saved_record_after_every_save(tmp_p
     saves = [name for name in written if name in ("task.json", "thought.md")]
     assert (task.terminal, task.awaiting_thought) == ("interrupted", True) and len(checked) > 4
     assert checked[-1] == task.tick and [m.kind for m in task.moves] == ["task", "rest"]
-    assert saves == ["task.json", "thought.md"] * len(checked)  # each save: the record, then its view
+    assert saves == ["thought.md", "task.json"] * len(checked)  # each save: the view, then the record (its commit)
     assert root.thought_file(task.id).read_text(encoding="utf-8") == render_thought(load(root, task.id))
     assert root.thought_file(task.id) == root.state_dir(task.id) / "thought.md"
     assert not list(root.state_dir(task.id).glob("*.tmp"))

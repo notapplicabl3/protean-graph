@@ -18,11 +18,17 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 
+from protean.graph import budget
 from protean.graph.budget import Caps
 from protean.state import Task
 
 KILL_DRAIN_SECONDS = 5
 CALL_FLOOR_USD = 0.50
+# Every seat launches with the user's MCP servers off: `--setting-sources ""` drops settings and CLAUDE.md but not
+# the user-level MCP servers (claude.ai connectors, Firecrawl, REA), which attached to the unsandboxed thinker in the
+# first thinking session and had the CLI inject a 58-tool roster (~50k tokens, a cache break) into every resumed
+# process — tools no seat may call. Probed 2026-10-21: the init reports `mcp_servers: []` under these flags.
+NO_MCP: tuple[str, ...] = ("--strict-mcp-config", "--mcp-config", '{"mcpServers":{}}')
 
 
 @dataclass
@@ -53,9 +59,12 @@ def no_charge(usd: float) -> None:
     """The default `charge`: a caller that keeps no books."""
 
 
-def usd_left(task: Task, caps: Caps, spent: float = 0.0) -> float:
-    """Dollars left under the task's ceiling, after `spent` more."""
-    return caps.max_usd + task.extra_usd - task.cost_usd - spent
+def usd_left(task: Task, caps: Caps, spent: float = 0.0, *, reader: bool = False) -> float:
+    """Dollars left under the task's ceiling, after `spent` more: the allowance less the counted spend (the reader's
+    excluded), or for a `reader` call its own budget, `reader_max_usd` less what the reader has spent."""
+    if reader:
+        return caps.reader_max_usd - budget.reader_usd(task) - spent
+    return caps.max_usd + task.extra_usd - budget.counted_usd(task) - spent
 
 
 def _cents(value: float) -> str:
@@ -63,17 +72,20 @@ def _cents(value: float) -> str:
     return f"{max(math.floor(value * 100 + 1e-9) / 100, 0.0):.2f}"
 
 
-def floor_reason(task: Task, caps: Caps, spent: float = 0.0) -> str | None:
-    """Why no call may be made: less left than the call floor. None while a call may be made."""
-    left = usd_left(task, caps, spent)
+def floor_reason(task: Task, caps: Caps, spent: float = 0.0, *, reader: bool = False) -> str | None:
+    """Why no call may be made: less left than the call floor (under the reader's own budget for a `reader` call).
+    None while a call may be made."""
+    left = usd_left(task, caps, spent, reader=reader)
     if left < CALL_FLOOR_USD:
-        return f"max_usd: remaining ${_cents(left)} below the ${CALL_FLOOR_USD:.2f} call floor"
+        ceiling = "reader_max_usd" if reader else "max_usd"
+        return f"{ceiling}: remaining ${_cents(left)} below the ${CALL_FLOOR_USD:.2f} call floor"
     return None
 
 
-def usd_cap(configured: float, task: Task, caps: Caps, spent: float = 0.0) -> str:
-    """The `--max-budget-usd` value: the configured cap clipped to what is left, down to the cent."""
-    return _cents(min(configured, usd_left(task, caps, spent)))
+def usd_cap(configured: float, task: Task, caps: Caps, spent: float = 0.0, *, reader: bool = False) -> str:
+    """The `--max-budget-usd` value: the configured cap clipped to what is left (the reader's own budget for a `reader`
+    call), down to the cent."""
+    return _cents(min(configured, usd_left(task, caps, spent, reader=reader)))
 
 
 PER_CALL_LIMIT, TASK_BUDGET = "per_call_limit", "task_budget"

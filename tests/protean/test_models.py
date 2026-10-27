@@ -30,7 +30,7 @@ def _argv_models(root: Root, caps: Caps) -> list[list[str]]:
     """The `--model` values in the director's, the editor's and the reader's argv, in that order."""
     task = Task(id="task-20260927T120000", goal="g", workspace="/tmp/ws")
     clone = root.clones_dir(task.id) / "u1"
-    argvs = (director.argv(task, caps, root, None), worker.argv(task, caps, root, clone, "sandbox-exec"),
+    argvs = (director.argv(task, caps, root), worker.argv(task, caps, root, clone, "sandbox-exec"),
              reader.argv(task, caps, root, clone, "sandbox-exec"))
     return [[argv[i + 1] for i, arg in enumerate(argv) if arg == "--model"] for argv in argvs]
 

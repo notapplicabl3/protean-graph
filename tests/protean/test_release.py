@@ -164,7 +164,10 @@ def test_an_approved_held_plan_at_a_ceiling_makes_no_call_stays_held_and_is_rele
 
 def test_the_call_floor_reached_between_two_admission_calls_keeps_the_plan_held(accepted: tuple[Root, Task]):
     root, task = accepted
-    task.cost_usd, task.mode = 23.9, HOLD  # $1.10 left: the first reader call ($0.65) leaves less than the floor
+    task.mode = HOLD
+    from protean.state import Call  # noqa: PLC0415 — 2026-10-20: the reader's own budget gates its calls, not the
+    # allowance; $6.00 spent leaves $1.00, and the first reader call ($0.65) leaves less than the floor
+    task.calls.append(Call(id="c-r", seat="reader", attempt=1, cap_usd=3.0, outcome="ok", charge_usd=6.0, booked=True))
     task.held = Held(kind=PLAN, units=[_branch_unit("u-2"), _branch_unit("u-3")], approved=True)
     save(root, task)
     costly = {**YES, "total_cost_usd": 0.65}
@@ -173,7 +176,9 @@ def test_the_call_floor_reached_between_two_admission_calls_keeps_the_plan_held(
     assert len(runner.calls) == 1 and task.held is not None and task.held.approved
     assert [u.id for u in task.held.units] == ["u-2", "u-3"] and [u.id for u in task.units] == ["u-1"]
     assert all("to_director" not in e for e in _events(root, "branch_refused"))
-    assert loop.ceiling(task, Caps()) == "max_usd: remaining $0.45 below the $0.50 call floor"
+    from protean.runner import floor_reason  # noqa: PLC0415
+    assert loop.ceiling(task, Caps()) is None  # the session is at no ceiling: the reader's spend is not counted
+    assert floor_reason(task, Caps(), reader=True) == "reader_max_usd: remaining $0.35 below the $0.50 call floor"
 
 
 # --- a released plan's reader that leaves a question open ends the tick ---

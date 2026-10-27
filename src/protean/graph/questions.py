@@ -3,8 +3,8 @@
 Deterministic and model-free. It is attached to the console on one side (the question is emitted there, the answer
 lands there) and to the runtime on the other (the loop calls these functions and acts on what they return); it has no
 edge to the director. A runtime question or its answer never becomes a `to_director` note, and this module never
-depends on `graph/director.py`. The reasons: `unknown_spend`, `cap_hit`, `invalid_plan`, `no_progress`, `stale_tip`
-(`done_refused` only on goal-mode records, which load and are never resumed as sessions). Spend that reaches the
+depends on `graph/director.py`. The reasons: `unknown_spend`, `cap_hit`, `invalid_plan`, `no_progress`, `stale_tip`,
+`reader_cap` (`done_refused` only on goal-mode records, which load and are never resumed as sessions). Spend that reaches the
 session's allowance is no question: it is the ceiling stop (`loop._book`, `loop.ceiling`), which only `extend` clears.
 
 `ask` is the one place any question is opened, the director's own included: that is bookkeeping in `task.json`; the
@@ -13,19 +13,25 @@ director's questions and their answers stay the director's (`loop._deliver`).
 
 from __future__ import annotations
 
+from collections.abc import Iterable
 from typing import Any
 
 from protean import state
+from protean.graph.console import is_yes
 from protean.runner import PER_CALL_LIMIT
 from protean.state import RUNTIME, Call, Question, Root, Task, Unit
 
 
-def ask(root: Root, task: Task, asker: str, reason: str, text: str, **context: Any) -> str:
+def ask(root: Root, task: Task, asker: str, reason: str, text: str, *, logged: Iterable[dict[str, Any]] = (),
+        **context: Any) -> str:
     """Open a question for the operator in `task.json`; `context` is what the runtime needs to act on the answer. Saved
-    before it is logged, so no client sees an id the file lacks. The task holds at the next tick boundary."""
+    before it is logged, so no client sees an id the file lacks; `logged` are events of what that same save holds (a
+    booking), logged before the question. The task holds at the next tick boundary."""
     with state.LOCK:
         question = state.add_question(task, asker, reason, text, context)
         state.save(root, task)
+        for event in logged:
+            state.append_log(root, task.id, event)
         state.append_log(root, task.id, {"event": "question", "id": question.id, "asker": asker, "reason": reason,
                                          "text": text, **context})
     return f"asked the operator ({question.id}): {' '.join(text.split())[:160]}"
@@ -34,7 +40,11 @@ def ask(root: Root, task: Task, asker: str, reason: str, text: str, **context: A
 def consume(question: Question) -> dict[str, Any]:
     """Act once on a runtime answer the console landed; returns the log event. It stays with the runtime: the
     disposition says what the runtime did, and nothing reaches the director."""
-    question.disposition = {"cap_hit": "extended", "stale_tip": "retried"}.get(question.reason, "continued")
+    if question.reason == "reader_cap":  # `yes` asks the reader again; `no` takes the cap hit's own path
+        refused = "refused" if question.context["reader_cap"]["check"] == "admission" else "rejected"
+        question.disposition = "reasked" if is_yes(question.answer or "") else refused
+    else:
+        question.disposition = {"cap_hit": "extended", "stale_tip": "retried"}.get(question.reason, "continued")
     return {"event": "runtime_answer", "id": question.id, "reason": question.reason,
             "disposition": question.disposition}
 
@@ -47,6 +57,11 @@ def how(question: Question) -> str:
         return f"`protean ctl answer {question.id} yes` continues under the unknown spend"
     if question.reason == "no_progress":
         return f"`protean ctl answer {question.id} yes` calls the thinker again"
+    if question.reason == "reader_cap":
+        undone = ("refuses the branch" if question.context.get("reader_cap", {}).get("check") == "admission"
+                  else "rejects the attempt")
+        return (f"`protean ctl answer {question.id} yes` asks the reader once more under the wider cap; "
+                f"`protean ctl answer {question.id} no` {undone} as a cap hit")
     return f"answer it with `protean ctl answer {question.id} <text>`"
 
 
@@ -128,3 +143,40 @@ def unknown_spend(root: Root, task: Task, unreceipted: list[Call]) -> None:
                 "Paid work is held. Answer `yes` to continue under that uncertainty; "
                 "`protean resume --abandon` closes the task.")
     ask(root, task, RUNTIME, "unknown_spend", question, unknown_spend=[c.id for c in unreceipted])
+
+
+def reader_cap(root: Root, task: Task, held: dict[str, Any], calls: list[Call], caps_usd: tuple[float, float],
+               floor: str | None = None, logged: Iterable[dict[str, Any]] = ()) -> str:
+    """A reader call reached its dollar cap under the wider cap too (or the wider call had no room under the call
+    floor): the attempt or the plan `held` names (`check` `weakening` or `admission`, `unit`) is held, neither refused
+    nor rejected, on a runtime question. `calls` are the reader's calls on this check so far, each booked, the last in
+    this same save (`logged`); `caps_usd` the per-call cap and the wider one. `yes` asks once more under the wider cap
+    (`owed`); `no` takes the path a cap hit took before (the attempt rejected unchecked, the branch refused); `extend`
+    alone never releases it."""
+    cost = sum(call.charge_usd or 0.0 for call in calls)
+    held = {**held, "calls": [call.id for call in calls], "cost_usd": cost}
+    narrow, wide = caps_usd
+    tried = ", then ".join(f"{call.id} at ${call.cap_usd:.2f}" for call in calls)
+    if floor:
+        tried += f"; the wider call could not start ({floor})"
+    if held["check"] == "weakening":
+        what = f"weakening check on {held['unit']} (attempt {held['attempt']})"
+        hold, yes, no = ("The attempt is held, neither graded nor rejected.", "grades the attempt on its verdict",
+                         "rejects the attempt as unchecked (weakening check could not run)")
+    else:
+        what = f"branch admission check on {held['unit']}"
+        hold, yes, no = ("The plan is held unadmitted, not refused.", "admits or refuses on its verdict",
+                         "refuses the branch (cap_hit) and the plan goes back to the thinker")
+    text = (f"The reader's {what} reached its dollar cap: {tried}. The per-call cap is reader_call_usd "
+            f"${narrow:.2f}, the re-ask's ${wide:.2f} (twice it, clipped by what the allowance has left); the reader "
+            f"has cost ${cost:.2f} on this check so far. {hold} Answer `yes` to ask the reader once more under the "
+            f"${wide:.2f} cap (it {yes}); `no` {no}. `extend` alone does not release it; "
+            "`protean resume --abandon` closes the session.")
+    return ask(root, task, RUNTIME, "reader_cap", text, logged=logged, reader_cap=held)
+
+
+def owed(task: Task, check: str) -> Question | None:
+    """The answered `reader_cap` question on `check` (`weakening` or `admission`) the runtime has not acted on yet
+    (`settled`), or None."""
+    return next((q for q in task.questions if q.reason == "reader_cap" and q.status == "answered"
+                 and q.context["reader_cap"]["check"] == check and not q.context.get("settled")), None)

@@ -1,22 +1,50 @@
 """Shared fixtures for the protean battery: the model-binary and `osascript` shims on PATH, no unattended wait,
 a loop clock that stands still unless a test moves it, a scratch brain root, and a check that a killed process is
-gone."""
+gone. For speed only: no machine-global git hook in a scratch repository, a 5 ms console poll, and
+`dry.make_workspace` as a copy of one workspace the real function made for the run (`_copied_workspace`)."""
 
 from __future__ import annotations
 
 import os
+import shutil
+import subprocess
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
 from pathlib import Path
 
 import pytest
 
-from protean import loop
+from protean import dry, loop
 from protean.dry import REPO
 from protean.graph import console
 from protean.state import Predicate, Root, Task, Unit
 
 SHIM_DIR = Path(__file__).resolve().parent / "shim"
+_REAL_MAKE_WORKSPACE = dry.make_workspace
+_TEMPLATE: list[Path] = []  # the run's one real workspace, once `workspace_template` made it
+
+
+def _copied_workspace(path: Path) -> Path:
+    """`dry.make_workspace` in the battery: a copy of the run's one real workspace (`workspace_template`), the same
+    bytes, commit and refs, with its index refreshed against the copied files so git sees it as it sees a fresh one.
+    It saves the `init`, `add` and `commit` of each of a few hundred workspaces; no test needs its own seed commit.
+    Before the template exists, the real function runs."""
+    if not _TEMPLATE:
+        return _REAL_MAKE_WORKSPACE(path)
+    shutil.copytree(_TEMPLATE[0], path, symlinks=True)
+    subprocess.run(["git", "update-index", "-q", "--refresh"], cwd=path, check=True, capture_output=True)
+    return path
+
+
+dry.make_workspace = _copied_workspace  # set before any test module binds the name (`from protean.dry import ...`)
+
+
+@pytest.fixture(scope="session", autouse=True)
+def workspace_template(tmp_path_factory: pytest.TempPathFactory) -> Iterator[Path]:
+    """The run's one workspace from the real `dry.make_workspace`, which every later one copies."""
+    _TEMPLATE.append(_REAL_MAKE_WORKSPACE(tmp_path_factory.mktemp("template") / "ws"))
+    yield _TEMPLATE[0]
+    _TEMPLATE.clear()
 
 
 @pytest.fixture(autouse=True)
@@ -27,6 +55,30 @@ def shim_on_path(monkeypatch: pytest.MonkeyPatch) -> Path:
     monkeypatch.delenv("PROTEAN_OSASCRIPT_LOG", raising=False)
     monkeypatch.setattr(console, "UNATTENDED_SECONDS", 0)
     return SHIM_DIR
+
+
+@pytest.fixture(scope="session", autouse=True)
+def no_machine_git_hooks() -> Iterator[None]:
+    """For the whole run (module fixtures too), every git command a test runs, or the code under test runs, sees
+    `core.hooksPath` as an empty place: a machine-global hook (a secret scan on each commit) never runs in a scratch
+    repository. No test pins a git hook, and the hook cost the battery about 30 ms per commit. Added after any
+    `GIT_CONFIG_*` pairs the environment already carries."""
+    count = int(os.environ.get("GIT_CONFIG_COUNT") or 0)
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setenv(f"GIT_CONFIG_KEY_{count}", "core.hooksPath")
+        patch.setenv(f"GIT_CONFIG_VALUE_{count}", os.devnull)
+        patch.setenv("GIT_CONFIG_COUNT", str(count + 1))
+        yield
+
+
+@pytest.fixture(scope="session", autouse=True)
+def fast_console_poll() -> Iterator[None]:
+    """For the whole run, the console's and the lobby's poll (`console.POLL_SECONDS`: the server loop, a stream's tail,
+    the close's wait for clients) at 5 ms, not 50: each close waits up to one poll for the server thread to stop, and
+    the battery closes a console a few hundred times. What a poll sees does not change, only how soon."""
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr(console, "POLL_SECONDS", 0.005)
+        yield
 
 
 class Clock:

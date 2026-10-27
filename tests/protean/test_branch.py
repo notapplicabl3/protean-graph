@@ -2,8 +2,9 @@
 
 A new predicate may name `parents`: accepted, retained predicates it inherits, one-to-many or many-to-one, with the
 unit's `rationale`. Before the unit enters the task, inside the same tick, the runtime makes one fresh, read-only
-`reader` call (never through the director): `yes` admits; `no`, or any call that fails, times out, reaches its cap,
-leaves no receipt or answers anything else, returns the whole plan to the director as one line on the retry path. The
+`reader` call (never through the director): `yes` admits; `no`, or any call that fails or answers anything else,
+returns the whole plan to the director as one line on the retry path (a call that reaches its cap is asked again,
+`test_reader_cap.py`; one that times out or leaves no receipt holds paid work). The
 parents stay in force until the branching unit is integrated, except on that unit's own candidate: once every child
 passes there, the parents of those children are excused from its re-check, so the unit may rename or remove what they
 pinned. At integration each gains its children, keeps its record and the last commit it passed on, and leaves the
@@ -284,7 +285,8 @@ def test_the_branch_scenario_admits_grades_the_children_and_retires_the_parent(e
     clone = reader.clone_dir(root, task)
     assert argv[:2] == [worker.sandbox_binary(), "-p"]
     assert argv[2] == reader.sandbox_profile(clone, workspace, root.console_file(task.id))
-    assert argv[3:] == ["claude", "-p", "--setting-sources", "", "--output-format", "json", "--max-budget-usd", "1.50",
+    assert argv[3:] == ["claude", "-p", "--setting-sources", "", "--strict-mcp-config", "--mcp-config",
+                        '{"mcpServers":{}}', "--output-format", "json", "--max-budget-usd", "1.50",
                         "--model", "claude-opus-5", "--permission-mode", "dontAsk", "--tools", "Read", "Grep", "Glob",
                         "--allowedTools", "Read", "Grep", "Glob", "--system-prompt", "# reader prompt\n"]
     profile = argv[2]
@@ -367,8 +369,6 @@ ANSWER = '{"verdict": "yes"|"no", "note": "<one line>"}'
 OUTCOMES = [  # (reader entry, reason, note, call outcome, charge)
     (_read("", 0.1, is_error=True, subtype="error_during_execution"), "error",
      "the reader call ended in error: error_during_execution", "error", 0.1),
-    (_read("", 1.52, is_error=True, subtype="error_max_budget_usd"), "cap_hit", "the reader call reached its $1.50 cap",
-     "error", 1.52),
     ({"type": "result", "is_error": False, "total_cost_usd": 0.05}, "malformed",
      "the reader's receipt carries no result text", "ok", 0.05),
     (_read('Sure: {"verdict": "yes", "note": "fine"}'), "malformed", f"the answer is not one JSON object {ANSWER}",
@@ -431,12 +431,15 @@ def test_the_reader_cap_is_clipped_like_any_seat_and_no_call_starts_under_the_fl
     gate.admit(task, [u2], Caps(reader_call_usd=2.0), root, runner)
     gate.admit(task, [u2], Caps(reader_call_usd=2.0), root, runner, spent=0.2)
     caps = [argv[argv.index("--max-budget-usd") + 1] for argv, _, _, _ in runner.calls]
-    assert caps == ["1.23", "0.98"]  # what was left; then less the director's unbooked 0.20 and the first 0.05
-    task.cost_usd = 24.6
+    # the reader's own budget (2026-10-20): $7.00 less nothing, then less the first call's 0.05 and the unbooked 0.20,
+    # both well above the $2.00 per-call cap; the allowance's $1.23 left never clips a reader call
+    assert caps == ["2.00", "2.00"]
+    from protean.state import Call  # noqa: PLC0415 — one booked reader call that leaves $0.40 of the reader's budget
+    task.calls.append(Call(id="c-r", seat="reader", attempt=1, cap_usd=3.0, outcome="ok", charge_usd=6.5, booked=True))
     floor = gate.admit(task, [u2], Caps(), root, runner)
     assert len(runner.calls) == 2 and floor.refused == [
-        "unit 'u-2': branch refused, the reader gave no verdict (floor): no reader call: max_usd: remaining $0.40 "
-        "below the $0.50 call floor"]
+        "unit 'u-2': branch refused, the reader gave no verdict (floor): no reader call: reader_max_usd: remaining "
+        "$0.40 below the $0.50 call floor"]
 
 
 def test_an_interrupted_reader_call_books_the_unbooked_spend_with_its_cap(accepted: tuple[Root, Task, Unit]):

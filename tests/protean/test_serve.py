@@ -11,6 +11,7 @@ import http.client
 import json
 import os
 import socket
+import subprocess
 import threading
 import time
 from pathlib import Path
@@ -215,6 +216,40 @@ def test_think_served_waits_for_a_think_after_its_ideas_and_shows_the_thought_re
     assert [m.kind for m in task.moves] == ["ideas", "explore", "task", "rest"] and task.units[0].integrated
     assert (task.terminal, task.awaiting_thought, [t.text for t in task.thoughts]) == ("interrupted", True,
                                                                                       ["Go with i1."])
+
+
+def test_think_served_lists_the_documents_its_branches_committed_and_serves_them_byte_identical():
+    """The documents order's fixture row: `think`'s task unit commits `notes/hello.md` beside `hello.txt` and its
+    explore commits `notes/hello-draft.md`; at the rest the snapshot's `artifacts` lists both branches, each with its
+    tip, and `GET /file` returns the fixture's `write` text byte-identical."""
+    served = Served("think")
+    stream = served.stream()
+    assert served.call("POST", "/resume", {})[0] == 200
+    stream.wait_for(lambda e: e.get("event") == "ideas")
+    assert served.call("POST", "/think", {"text": "Go with i1."})[0] == 200
+    stream.wait_for(lambda e: e.get("event") == "thought" and e.get("kind") == "rest")
+    status, snap = served.call("GET", "/snapshot")
+    workspace, task_id = Path(snap["workspace"]), served.task_id
+
+    def rev(ref: str) -> str:
+        return subprocess.run(["git", "rev-parse", ref], cwd=workspace, capture_output=True, text=True,
+                              check=True).stdout.strip()
+
+    assert status == 200 and snap["artifacts"] == {"base": rev("HEAD"), "branches": [
+        {"branch": f"task/{task_id}", "tip": rev(f"task/{task_id}"), "paths": ["hello.txt", "notes/hello.md"]},
+        {"branch": f"explore/{task_id}/1", "tip": rev(f"explore/{task_id}/1"), "paths": ["notes/hello-draft.md"]}]}
+    conn = http.client.HTTPConnection("127.0.0.1", served.port, timeout=10)
+    try:
+        conn.request("GET", f"/file?branch=task/{task_id}&path=notes/hello.md",
+                     headers={"Authorization": f"Bearer {served.token}"})
+        resp = conn.getresponse()
+        got = (resp.status, resp.getheader("Content-Type"), resp.read())
+    finally:
+        conn.close()
+    written = dry.read_jsonl(dry.FIXTURES / "think" / "worker.jsonl")[1]["write"]["notes/hello.md"]
+    assert got == (200, "application/octet-stream", written.encode("utf-8"))
+    stream.leave_after_the_rest()
+    assert served.finish().terminal == "interrupted"
 
 
 def test_the_dry_verb_takes_the_serve_flags():

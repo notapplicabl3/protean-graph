@@ -1,15 +1,16 @@
-"""The `protean` command: think, resume, status, dry and ctl.
+"""The `protean` command: think, resume, status, dry, ctl and lobby.
 
 Exit codes: parked 12 (`interrupted`: a question, a held progression or a wait for a thought, with no client
-attached), stopped 11 (a ceiling, or `--abandon`), `stop` or Ctrl-C 130, a usage error or a refusal 2 (an unknown verb
-such as the retired `run` included); 0 for a command that only reads or writes state (`status`, `ctl`), and for a
-record of runs 1–6 that ended `done` (a session never does)."""
+attached), stopped 11 (a ceiling, `--abandon` or the console's `close`), `stop` or Ctrl-C 130, a usage error or a refusal 2 (an unknown verb
+such as the retired `run` included); 0 for a command that only reads or writes state (`status`, `ctl`), for the lobby
+closed by a signal, and for a record of runs 1–6 that ended `done` (a session never does)."""
 
 from __future__ import annotations
 
 import argparse
 import json
 import re
+import shutil
 import signal
 import subprocess
 import sys
@@ -17,7 +18,7 @@ from collections.abc import Sequence
 from pathlib import Path
 
 from protean import dry, loop, state
-from protean.graph import budget, console
+from protean.graph import budget, console, lobby
 from protean.graph.budget import Caps, load_caps
 from protean.operator import load_operator
 from protean.runner import real_runner
@@ -75,6 +76,8 @@ def build_parser() -> argparse.ArgumentParser:
     ops.add_parser("pause", help="hold at the next tick boundary (live brain)")
     ops.add_parser("resume", help="release a pause (live brain)")
     ops.add_parser("stop", help="the Ctrl-C path: book the call in flight, save, exit 130 (live brain)")
+    ops.add_parser("close", help="end the session for good: open questions superseded, held work dropped, the record "
+                                 "kept readable; a live brain exits, a parked session closes in task.json")
     think_op = ops.add_parser("think", help="add a thought for the thinker; it ends a wait for one and returns what is "
                                             "held")
     think_op.add_argument("text", nargs="+")
@@ -90,6 +93,8 @@ def build_parser() -> argparse.ArgumentParser:
     ops.add_parser("approve", help="release the one plan, retry or explore held in hold mode")
     ops.add_parser("snapshot", help="print the session as the console sees it")
     ops.add_parser("watch", help="print the snapshot, then the stream, until the run ends (an attached client)")
+    verbs.add_parser("lobby", help="serve the lobby (state/lobby.json): list the sessions, read one, start or resume "
+                                   "one; no model call, until Ctrl-C or SIGTERM")
     return parser
 
 
@@ -183,6 +188,8 @@ def _main(argv: Sequence[str] | None) -> int:
     args = build_parser().parse_args(argv)
     root = Root(args.brain.expanduser().resolve())
     try:
+        if args.verb == "lobby":
+            return lobby.run(root, print)
         if args.verb == "status":
             return status(root)
         if args.verb == "ctl":
@@ -206,6 +213,12 @@ def _main(argv: Sequence[str] | None) -> int:
         print(f"protean: {exc}", file=sys.stderr)
         return EXIT_USAGE
     except KeyboardInterrupt:
+        closed = state.current(root) if args.verb in ("think", "resume") else None
+        if closed is not None and closed.stop_reason == "closed":  # the console's `close` took the Ctrl-C path out
+            shutil.rmtree(root.clones_dir(closed.id), ignore_errors=True)
+            print("protean: session closed; any spend in flight is booked on it. The record stays readable.",
+                  file=sys.stderr)
+            return EXIT["stopped"]
         print("protean: interrupted; any spend in flight is booked on the session. `protean resume` continues it.",
               file=sys.stderr)
         return EXIT_INTERRUPTED

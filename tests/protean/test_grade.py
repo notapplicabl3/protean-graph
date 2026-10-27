@@ -249,10 +249,10 @@ def test_an_interrupted_command_leaves_no_live_group(clone: Path, monkeypatch: p
         raise KeyboardInterrupt
     monkeypatch.setattr(subprocess.Popen, "communicate", interrupted)
     with pytest.raises(KeyboardInterrupt):
-        grade(_unit(P("command", {"cmd": "(sleep 1; touch late.txt) & sleep 30"})), clone, 0)
+        grade(_unit(P("command", {"cmd": "(sleep 0.5; touch late.txt) & sleep 30"})), clone, 0)
     (proc,) = started
     assert proc.poll() is not None
-    time.sleep(1.5)
+    time.sleep(1.0)
     assert not (clone / "late.txt").exists()
 
 

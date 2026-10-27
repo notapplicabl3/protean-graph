@@ -19,7 +19,7 @@ from protean import dry, loop, state
 from protean.dry import REPO, ScriptedRunner, make_workspace, scenario_runner
 from protean.graph import console, director, gate, questions, worker
 from protean.graph.budget import Caps
-from protean.state import DIRECTOR, EXPLORE, PLAN, RETRY, RUNTIME, Held, Idea, OpenItem, Predicate, Root, Task, Unit
+from protean.state import DIRECTOR, EXPLORE, PLAN, RETRY, RUNTIME, Call, Held, Idea, OpenItem, Predicate, Root, Task, Unit
 
 EMITTED = re.compile(r"""["']event["']\s*:\s*["']([a-z_]+)["']""")
 DOC_ROW = re.compile(r"^\|\s*(`[a-z_]+`(?:\s*,\s*`[a-z_]+`)*)\s*\|", re.MULTILINE)
@@ -171,7 +171,9 @@ def _emit_the_rest(base: Path) -> tuple[Root, Task]:
                                     ideas=ideas), 0.1, task, root, admitted=True)  # ideas, thought
     loop._accept(director.MoveReply(kind="ask", standing="Two ways are left.", question="which one?"), 0.1, task, root,
                  admitted=True)  # an ask move, its question
+    task.project = "demo"  # a named project: the rest also writes the brain's long-term memory and logs `memory`
     loop._accept(director.MoveReply(kind="rest", standing="It rests."), 0.1, task, root, admitted=True)  # rest
+    loop._remember(task, root)  # memory: the memory node, walked after a rest firing
     loop._park(task, ("thought", task.moves[-1].id), caps, root)  # parked, on a thought
     task.terminal, task.stop_reason = "stopped", "max_ticks: 100 >= 100"
     loop._settle(task, caps, root, said.append)  # released
@@ -179,7 +181,21 @@ def _emit_the_rest(base: Path) -> tuple[Root, Task]:
     questions.ask(root, task, RUNTIME, "stale_tip", "moved", stale_tip="u-1")
     questions.repaired(root, task)  # repaired
     worker._transcript(root, task, u1, task.calls[0])('{"type": "system"}')  # transcript
+    # A re-asked reader call names the call it asks again (`retry_of`); no dry scenario drives a cap-hit re-ask.
+    gate._book(task, root, Call(id="c-reader-2", seat="reader", attempt=1, cap_usd=3.0, unit="u-1", tick=task.tick),
+               retry_of=task.calls[0].id)  # call, with retry_of
     loop._prepare(task, root, caps, 0.0, 0, True, said.append)  # abandoned
+    return root, task
+
+
+def _close_one(base: Path) -> tuple[Root, Task]:
+    """One `close` (2026-10-20), on its own session: a closed record admits nothing after, so it cannot share the rest's."""
+    root = _seed(base)
+    task = Task(id="task-20261011T180000", goal="g", workspace=str(base / "unused"))
+    state.save(root, task)
+    task.held = Held(kind=PLAN, units=[Unit("u-1", "write a.txt", [Predicate("file_exists", {"path": "a.txt"})])])
+    questions.ask(root, task, DIRECTOR, "question", "which file?")
+    state.append_log(root, task.id, console.apply(task, Caps(), "close", {}, True))  # close
     return root, task
 
 
@@ -242,6 +258,8 @@ def harvest(tmp_path_factory: pytest.TempPathFactory) -> tuple[dict[str, set[str
             snaps[f"{scenario} events"] = {event["event"] for event in state.read_log(root, task.id)}
         root, task = _emit_the_rest(base / "rest")
         _keys(root, task.id, keys)
+        closed_root, closed = _close_one(base / "close")
+        _keys(closed_root, closed.id, keys)
     snaps["rest"] = console.snapshot(task, Caps(), live=False) | {"log_bytes": 0, "transcript_bytes": 0}
     return keys, snaps
 
@@ -268,6 +286,9 @@ def test_every_field_the_contract_lists_for_the_snapshot_is_in_it(harvest):
     assert sorted(snapshot_fields("thoughts") - set(snap["thoughts"][0])) == []
     assert sorted(snapshot_fields("thought") - set(snap["thought"])) == []
     assert sorted(snapshot_fields("moves") - _union(think["moves"] + snap["moves"])) == []
+    assert snapshot_fields("fired") == set(think["fired"]) and set(think["fired"]["fire"][0]) == {"node", "move", "unit"}
+    assert snapshot_fields("graph") == set(snap["graph"]) == {"nodes", "fires", "shapes"}
+    assert snapshot_fields("nodes") == _union(snap["graph"]["nodes"])
     unit = Unit("u-1", "write a.txt", [Predicate("file_exists", {"path": "a.txt"})])
     held = [console.held_view(h) for h in (Held(kind=PLAN, units=[unit]), Held(kind=RETRY, unit="u-1", attempt=2),
                                            Held(kind=EXPLORE, move="m2", brief="try b.txt"))]

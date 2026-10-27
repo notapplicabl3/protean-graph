@@ -35,7 +35,9 @@ def seeded(root: Root) -> Root:
     return root
 
 
-def test_first_call_mints_with_the_prompt_and_later_calls_resume(seeded: Root, task: Task):
+def test_a_thinker_call_within_the_hour_resumes_its_session_and_a_cold_one_starts_fresh(seeded: Root, task: Task):
+    """2026-10-22 (the operator: the session owns its short-term memory): a call under an hour after the last resumes
+    the seat's session; after that it starts fresh on the record. The user's MCP servers are off on every call."""
     runner = ScriptedRunner([_reply(_task_move(UNIT)), _reply({"rest": True, "state": {**STATE, "standing": "x."}})],
                             [])
     first = director.next_move(task, Caps(), seeded, runner)
@@ -43,8 +45,8 @@ def test_first_call_mints_with_the_prompt_and_later_calls_resume(seeded: Root, t
     assert [u.id for u in first.move.units] == ["u-2"] and first.move.standing == "b.txt is planned."
     argv, stdin, cwd, timeout = runner.calls[0]
     assert argv == [
-        "claude", "-p", "--setting-sources", "", "--output-format", "json", "--max-budget-usd", "2.00",
-        "--model", "claude-opus-5",
+        "claude", "-p", "--setting-sources", "", "--strict-mcp-config", "--mcp-config", '{"mcpServers":{}}',
+        "--output-format", "json", "--max-budget-usd", "2.00", "--model", "claude-opus-5",
         "--permission-mode", "dontAsk", "--tools", "Read", "Grep", "Glob", "--allowedTools", "Read", "Grep", "Glob",
         "--add-dir", "/tmp/ws", "--system-prompt", "# thinker prompt\n",
     ]
@@ -53,9 +55,15 @@ def test_first_call_mints_with_the_prompt_and_later_calls_resume(seeded: Root, t
     assert (message["thought"], message["units"][0]["id"], message["budget_left_usd"], message["notes"]) == (
         "make a.txt", "u1", 25.0, [])
     task.director_session, task.standing = first.session_id, first.move.standing
+    assert task.director_called_at and director.warm(task)  # the first call just returned: a warm stretch
     assert director.next_move(task, Caps(), seeded, runner).kind == "rest"
     argv2, _, cwd2, _ = runner.calls[1]
     assert argv2[-4:] == ["--resume", "sess-1", "--system-prompt", "# thinker prompt\n"] and cwd2 == cwd
+    task.director_called_at = "2026-10-22T00:00:00+00:00"  # a cold stretch: the next call is a fresh session
+    assert not director.warm(task)
+    runner.director.append(_reply({"rest": True, "state": {**STATE, "standing": "y."}}))
+    director.next_move(task, Caps(), seeded, runner)
+    assert "--resume" not in runner.calls[2][0] and runner.calls[2][0] == argv
 
 
 def test_a_malformed_reply_is_retried_once_then_becomes_the_runtime_s_question(seeded: Root, task: Task):
@@ -64,7 +72,7 @@ def test_a_malformed_reply_is_retried_once_then_becomes_the_runtime_s_question(s
     assert len(runner.calls) == 2 and reply.cost_usd == 0.75 and reply.move is None and reply.kind == "invalid"
     assert reply.question == "The thinker returned an invalid reply twice: units must be a non-empty list"
     assert "Your previous answer was rejected:\n- the reply holds no JSON object" in runner.calls[1][1]
-    assert runner.calls[1][0][-4:-2] == ["--resume", "sess-1"]
+    assert runner.calls[1][0][-4:-2] == ["--resume", "sess-1"]  # the retry resumes: seconds old, a warm stretch
 
 
 def test_the_retry_recovers_a_misspelled_predicate(seeded: Root, task: Task):
@@ -285,3 +293,22 @@ def test_the_message_shows_retain_only_on_a_delivery_only_predicate_and_the_prom
     assert prompt.count('"retain": false') == 1 and '"retain": false' in paragraph
     assert "re-checked" in paragraph and "cannot be dropped" in paragraph
     assert "accepted unit's retained predicates" in prompt
+
+
+def test_the_prompt_tells_the_thinker_that_committed_documents_reach_the_operator_in_the_app():
+    """PLAN § Next order — documents, item 3 (2026-10-22): told only once the console served them (`artifacts`,
+    `GET /file`), so the thinker never promises a channel that does not exist — and never one outside the workspace."""
+    prompt = PROMPT.read_text()
+    (paragraph,) = [line for line in prompt.splitlines() if line.startswith("Documents reach the operator")]
+    assert "listed for the operator in the app and readable there" in paragraph
+    assert "a worker writes only inside its clone of the workspace" in paragraph
+
+
+
+def test_the_prompt_tells_the_thinker_that_memory_is_earlier_sessions_and_never_overrides_this_one():
+    """The brain's long-term memory (the operator, 2026-10-22): `memory` in the message is earlier sessions on the same
+    project, built on, never in place of this session's own thoughts and decisions."""
+    prompt = PROMPT.read_text()
+    (paragraph,) = [line for line in prompt.splitlines() if line.startswith("Memory: ")]
+    assert "earlier sessions on this same project, oldest first" in paragraph
+    assert "it never overrides this session's `thoughts` or `decided`" in paragraph
